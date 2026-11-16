@@ -26,7 +26,10 @@ path ──tar──▶ zstd ──▶ split ──▶ AES-GCM(backup key) ─�
 ```
 
 1. The target file/directory is tarred and compressed with zstd.
-2. The stream is split into parts (`part_size`, default 256 MiB).
+2. The stream is split into parts (`part_size`, default 256 MiB). The archive is
+   staged into `tmp_dir` first, so the exact part count is known before anything
+   is uploaded (`stage_archive: false` / `--no-stage` packs and uploads in one
+   pass instead).
 3. Every part is encrypted with a **random key generated for this backup**, then encrypted
    again with your **single master key**. Both layers are required to read anything.
 4. Parts are uploaded as documents with a random delay between uploads.
@@ -54,10 +57,16 @@ Measured peak RSS is approximately `part_size` + 100–250 MiB (Node's own basel
 | 384 MiB | 256 MiB | ~490 MiB |
 | 1 GiB | 256 MiB | ~520 MiB |
 
-On a small VPS use `--part-size 64M` (or set `part_size: 67108864`). During restore, one
-encrypted part and its decrypted copy exist in `tmp_dir` at the same time, so keep about
-`2 x part_size` of free disk space there; the plaintext copy is deleted before the next
-part is downloaded.
+On a small VPS use `--part-size 64M` (or set `part_size: 67108864`).
+
+Disk space in `tmp_dir`:
+
+- During a **backup** with the default staging, the compressed archive plus one encrypted
+  part are kept there at the same time — roughly "archive size + 1 x part_size". If the
+  disk cannot hold the archive, use `--no-stage` (only one encrypted part is kept, but the
+  exact part count is not known until the end).
+- During a **restore**, one encrypted part and its decrypted copy exist at the same time
+  (~2 x part_size); the plaintext copy is deleted before the next part is downloaded.
 
 ## Requirements
 
@@ -162,6 +171,7 @@ Useful options:
 | `--zstd-level 15` | zstd compression level (1–22) |
 | `--delay 2,12` | random delay range in seconds between part uploads |
 | `--workers 8` | parallel upload workers per part (1–16, default 8) |
+| `--no-stage` | don't stage the archive first: pack and upload in one pass |
 | `--token-out <file>` | write the token to a `0600` file as well |
 | `--keep-tmp` | keep encrypted part files for debugging |
 
@@ -212,6 +222,7 @@ master_key_file: ./master.key
 prefix: tgbackup
 part_size: 268435456            # 256 MiB
 upload_workers: 8               # parallel upload workers per part (1-16)
+stage_archive: true             # pack first -> exact part count upfront
 zstd_level: 10
 upload_delay:
   min: 2
@@ -242,7 +253,7 @@ Handy for cron/containers:
 | `TGBACKUP_PROXY` | `socks5://user:pass@host:port` (falls back to a socks `SOCKS_PROXY`/`ALL_PROXY`) |
 | `TGBACKUP_MASTER_KEY` | master secret (base64url/hex/passphrase), no file needed |
 | `TGBACKUP_MASTER_KEY_FILE`, `TGBACKUP_SESSION_FILE`, `TGBACKUP_TMP_DIR` | paths |
-| `TGBACKUP_PART_SIZE`, `TGBACKUP_ZSTD_LEVEL`, `TGBACKUP_UPLOAD_WORKERS` | tuning |
+| `TGBACKUP_PART_SIZE`, `TGBACKUP_ZSTD_LEVEL`, `TGBACKUP_UPLOAD_WORKERS`, `TGBACKUP_STAGE_ARCHIVE` | tuning |
 | `TGBACKUP_CONNECT_TIMEOUT` | MTProto connect timeout in seconds |
 | `TGBACKUP_DELAY_MIN`, `TGBACKUP_DELAY_MAX` | upload delay seconds |
 | `TGBACKUP_DEBUG=1` | full stack traces |

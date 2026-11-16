@@ -107,6 +107,10 @@ test('backup -> token -> restore round-trip with a stubbed Telegram transport', 
     assert.equal(decoded.key.length, 32);
     assert.ok(uploadCalls.length > 1);
     assert.ok(uploadCalls.every((call) => call.workers === 3), 'configured upload workers must be passed through');
+    assert.ok(
+        uploadCalls.every((call, index) => call.caption.endsWith(`[${index + 1}/${uploadCalls.length}]`)),
+        'captions must contain the total part count',
+    );
 
     const destination = path.join(work, 'restored');
     await runRestore(config, { token, out: destination, keepTmp: false, interactive: false });

@@ -26,6 +26,11 @@ part_size: 268435456
 # above 16). Parts themselves are still uploaded sequentially.
 upload_workers: 8
 
+# Pack the whole archive to tmp_dir before uploading anything. Costs archive-
+# sized disk space there, but shows the exact part count upfront and captions
+# get the total ("[2/7]"). Set to false to pack and upload in one pass.
+stage_archive: true
+
 # zstd level (1..22). 10 is a good speed/size trade-off for backups.
 zstd_level: 10
 

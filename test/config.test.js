@@ -81,7 +81,19 @@ test('config exposes resolved paths and defaults', () => {
     const config = normalizeConfig(baseRaw, { configPath: '/tmp/dir/config.yml', baseDir: '/tmp/dir' });
     assert.equal(config.partSize, 256 * 1024 * 1024);
     assert.equal(config.zstdLevel, 10);
+    assert.equal(config.uploadWorkers, 8);
+    assert.equal(config.stageArchive, true);
     assert.equal(config.masterKeyFile, '/tmp/dir/master.key');
     assert.equal(config.sessionFile, '/tmp/dir/session.txt');
     assert.equal(config.proxy, null);
+
+    const noStage = normalizeConfig(
+        { ...baseRaw, stage_archive: false },
+        { configPath: '/tmp/dir/config.yml', baseDir: '/tmp/dir' },
+    );
+    assert.equal(noStage.stageArchive, false);
+    assert.throws(
+        () => normalizeConfig({ ...baseRaw, stage_archive: 'maybe' }, { configPath: '/tmp/x', baseDir: '/tmp' }),
+        /must be a boolean/,
+    );
 });

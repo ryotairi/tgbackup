@@ -11,16 +11,43 @@ function protectStdout() {
     const originalLog = console.log;
     const originalInfo = console.info;
     const originalDebug = console.debug;
+    const originalError = console.error;
 
     const redirect = (...args) => console.error(...args);
     console.log = redirect;
     console.info = redirect;
     console.debug = redirect;
 
+    // GramJS's keep-alive/update loop prints raw `Error: TIMEOUT` stack traces
+    // via console.error whenever a ping times out (typical through flaky SOCKS
+    // proxies). It reconnects on its own, so replace the scary trace with a
+    // throttled one-liner instead of hiding it completely.
+    let lastPingNote = 0;
+    console.error = (...args) => {
+        const first = args[0];
+        if (
+            first instanceof Error &&
+            first.message === 'TIMEOUT' &&
+            typeof first.stack === 'string' &&
+            first.stack.includes('telegram/client/updates.js')
+        ) {
+            const now = Date.now();
+            if (now - lastPingNote > 60000) {
+                lastPingNote = now;
+                originalError(
+                    'telegram keep-alive ping timed out; GramJS reconnects in the background, uploads continue',
+                );
+            }
+            return;
+        }
+        originalError(...args);
+    };
+
     return () => {
         console.log = originalLog;
         console.info = originalInfo;
         console.debug = originalDebug;
+        console.error = originalError;
     };
 }
 

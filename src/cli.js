@@ -15,7 +15,7 @@ const { UsageError, formatBytes, parseSize } = require('./util');
 
 const pkg = require('../package.json');
 
-const BOOLEAN_OPTIONS = new Set(['help', 'version', 'force', 'keepTmp', 'json', 'nonInteractive', 'qr', 'forceSms']);
+const BOOLEAN_OPTIONS = new Set(['help', 'version', 'force', 'keepTmp', 'json', 'nonInteractive', 'qr', 'forceSms', 'stage']);
 
 const USAGE = `tgbackup ${pkg.version} - encrypted, chunked backups in Telegram
 
@@ -44,6 +44,7 @@ backup options:
   --zstd-level <1-22>   zstd compression level (default from config)
   --delay <min,max>     random delay in seconds between part uploads
   --workers <1-16>      parallel upload workers per part (default 8)
+  --no-stage            pack and upload in one pass (no upfront part count)
   --token-out <file>    additionally write the token to a file (mode 0600)
   --keep-tmp            keep temporary part files
   --non-interactive     never prompt for a Telegram login
@@ -242,6 +243,7 @@ async function commandBackup(options, positionals) {
         uploadDelay: options.delay === undefined ? undefined : normalizeUploadDelay(parseDelay(options.delay)),
         uploadWorkers:
             options.workers === undefined ? undefined : normalizeUploadWorkers(options.workers, '--workers'),
+        stage: options.stage === undefined ? undefined : Boolean(options.stage),
         tokenOut: options.tokenOut === undefined ? undefined : requireValue(options.tokenOut, '--token-out'),
         keepTmp: Boolean(options.keepTmp),
         interactive: !options.nonInteractive,

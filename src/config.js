@@ -149,6 +149,15 @@ function normalizeUploadWorkers(value, label = 'upload_workers') {
     return workers;
 }
 
+function normalizeBooleanish(value, label, fallback) {
+    if (value === undefined || value === null) return fallback;
+    if (typeof value === 'boolean') return value;
+    const text = String(value).trim().toLowerCase();
+    if (['true', '1', 'yes', 'on'].includes(text)) return true;
+    if (['false', '0', 'no', 'off', 'none'].includes(text)) return false;
+    throw new UsageError(`${label} must be a boolean (true/false)`);
+}
+
 function normalizeConfig(raw, { configPath, baseDir }) {
     if (raw !== null && (typeof raw !== 'object' || Array.isArray(raw))) {
         throw new UsageError('config root must be a YAML mapping');
@@ -192,6 +201,12 @@ function normalizeConfig(raw, { configPath, baseDir }) {
         envValue('TGBACKUP_UPLOAD_WORKERS') ?? data.upload_workers,
     );
 
+    const stageArchive = normalizeBooleanish(
+        envValue('TGBACKUP_STAGE_ARCHIVE') ?? data.stage_archive,
+        'stage_archive',
+        true,
+    );
+
     const uploadDelay = normalizeUploadDelay(
         data.upload_delay === undefined
             ? {
@@ -222,6 +237,7 @@ function normalizeConfig(raw, { configPath, baseDir }) {
         partSize,
         zstdLevel,
         uploadWorkers,
+        stageArchive,
         uploadDelay,
         connectTimeoutMs: Math.round(connectTimeoutSeconds * 1000),
         premium,

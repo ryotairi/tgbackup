@@ -219,7 +219,9 @@ async function uploadDocument(client, options) {
     const input = await client.uploadFile({
         file: new CustomFile(fileName, size, filePath),
         workers,
-        onProgress: onProgress ? (percent) => onProgress(percent) : undefined,
+        // GramJS reports progress as a 0..1 fraction; convert it to percent so
+        // consumers (the CLI progress bar) do not show a stuck "0%".
+        onProgress: onProgress ? (fraction) => onProgress(Number(fraction) * 100) : undefined,
     });
 
     const message = await client.sendFile(target, {
