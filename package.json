@@ -1,0 +1,37 @@
+{
+  "name": "tgbackup",
+  "version": "2.0.0",
+  "description": "Encrypted chunked backups to Telegram (zstd + AES-256-GCM, per-backup keys, SOCKS proxy support)",
+  "main": "src/cli.js",
+  "type": "commonjs",
+  "bin": {
+    "tgbackup": "bin/tgbackup.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "config.example.yml",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "check": "node --check bin/tgbackup.js && node --check src/cli.js"
+  },
+  "engines": {
+    "node": ">=22.15.0"
+  },
+  "keywords": [
+    "telegram",
+    "backup",
+    "encryption",
+    "zstd",
+    "socks"
+  ],
+  "license": "ISC",
+  "dependencies": {
+    "qrcode-terminal": "^0.12.0",
+    "tar": "^7.5.23",
+    "telegram": "^2.26.22",
+    "yaml": "^2.9.1"
+  }
+}

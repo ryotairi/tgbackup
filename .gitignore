@@ -1,0 +1,13 @@
+node_modules/
+tmp/
+*.log
+
+# never commit secrets
+config.yml
+config.yaml
+tgbackup.yml
+tgbackup.yaml
+master.key
+session.txt
+*.token
+restore-*/
