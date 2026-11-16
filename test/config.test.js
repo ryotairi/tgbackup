@@ -57,6 +57,26 @@ test('part size is validated against account limits', () => {
     assert.equal(premium.partSize, 3 * 1024 ** 3);
 });
 
+test('upload workers default to 8 and are limited to 1..16', () => {
+    const config = normalizeConfig(baseRaw, { configPath: '/tmp/dir/config.yml', baseDir: '/tmp/dir' });
+    assert.equal(config.uploadWorkers, 8);
+
+    const custom = normalizeConfig(
+        { ...baseRaw, upload_workers: 3 },
+        { configPath: '/tmp/dir/config.yml', baseDir: '/tmp/dir' },
+    );
+    assert.equal(custom.uploadWorkers, 3);
+
+    assert.throws(
+        () => normalizeConfig({ ...baseRaw, upload_workers: 0 }, { configPath: '/tmp/x', baseDir: '/tmp' }),
+        /between 1 and 16/,
+    );
+    assert.throws(
+        () => normalizeConfig({ ...baseRaw, upload_workers: 17 }, { configPath: '/tmp/x', baseDir: '/tmp' }),
+        /between 1 and 16/,
+    );
+});
+
 test('config exposes resolved paths and defaults', () => {
     const config = normalizeConfig(baseRaw, { configPath: '/tmp/dir/config.yml', baseDir: '/tmp/dir' });
     assert.equal(config.partSize, 256 * 1024 * 1024);

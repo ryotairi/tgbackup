@@ -37,6 +37,28 @@ Restoring needs **both** the token and the master key. Losing either one makes t
 unreadable. The Telegram chat alone is not enough: without the master key the per-backup
 key cannot be used, and without the token there is no per-backup key at all.
 
+### Memory and disk
+
+Everything is streamed: the tar/zstd archive is never held in memory as a whole, only one
+part is staged in a **single** `part_size` buffer (default 256 MiB) that is reused for every
+part. Encryption is also streaming, in 4 MiB AES-GCM frames; no second copy of a part or of
+the archive is made.
+
+Measured peak RSS is approximately `part_size` + 100–250 MiB (Node's own baseline is
+~80 MiB), and does not grow with the size of the source:
+
+| source | `part_size` | peak RSS |
+| --- | --- | --- |
+| 384 MiB | 64 MiB | ~315 MiB |
+| 1 GiB | 64 MiB | ~340 MiB |
+| 384 MiB | 256 MiB | ~490 MiB |
+| 1 GiB | 256 MiB | ~520 MiB |
+
+On a small VPS use `--part-size 64M` (or set `part_size: 67108864`). During restore, one
+encrypted part and its decrypted copy exist in `tmp_dir` at the same time, so keep about
+`2 x part_size` of free disk space there; the plaintext copy is deleted before the next
+part is downloaded.
+
 ## Requirements
 
 - Node.js **>= 22.15** (built-in zstd; older Node has no `zlib.createZstdCompress`)
@@ -139,12 +161,15 @@ Useful options:
 | `--part-size 128M` | encrypted bytes per Telegram document |
 | `--zstd-level 15` | zstd compression level (1–22) |
 | `--delay 2,12` | random delay range in seconds between part uploads |
+| `--workers 8` | parallel upload workers per part (1–16, default 8) |
 | `--token-out <file>` | write the token to a `0600` file as well |
 | `--keep-tmp` | keep encrypted part files for debugging |
 
 Parts are uploaded one at a time. Between uploads the script sleeps for a random number of
-seconds (`upload_delay` in the config or `--delay`). Failed uploads/downloads are retried
-with exponential backoff.
+seconds (`upload_delay` in the config or `--delay`). Within one part, GramJS sends its
+MTProto chunks using `upload_workers` parallel workers (config `upload_workers` or
+`--workers`, default 8, max 16 — higher values are unstable). Failed uploads/downloads are
+retried with exponential backoff.
 
 ## Restore
 
@@ -186,6 +211,7 @@ telegram:
 master_key_file: ./master.key
 prefix: tgbackup
 part_size: 268435456            # 256 MiB
+upload_workers: 8               # parallel upload workers per part (1-16)
 zstd_level: 10
 upload_delay:
   min: 2
@@ -216,7 +242,7 @@ Handy for cron/containers:
 | `TGBACKUP_PROXY` | `socks5://user:pass@host:port` (falls back to a socks `SOCKS_PROXY`/`ALL_PROXY`) |
 | `TGBACKUP_MASTER_KEY` | master secret (base64url/hex/passphrase), no file needed |
 | `TGBACKUP_MASTER_KEY_FILE`, `TGBACKUP_SESSION_FILE`, `TGBACKUP_TMP_DIR` | paths |
-| `TGBACKUP_PART_SIZE`, `TGBACKUP_ZSTD_LEVEL` | tuning |
+| `TGBACKUP_PART_SIZE`, `TGBACKUP_ZSTD_LEVEL`, `TGBACKUP_UPLOAD_WORKERS` | tuning |
 | `TGBACKUP_CONNECT_TIMEOUT` | MTProto connect timeout in seconds |
 | `TGBACKUP_DELAY_MIN`, `TGBACKUP_DELAY_MAX` | upload delay seconds |
 | `TGBACKUP_DEBUG=1` | full stack traces |
@@ -246,7 +272,8 @@ Each part is a self-describing container:
 
 - No resume: an interrupted backup leaves uploaded parts in the chat but no token. Delete
   them manually.
-- Parts are uploaded sequentially to stay gentle on Telegram rate limits.
+- Parts are uploaded sequentially to stay predictable on Telegram rate limits; within one
+  part, up to `upload_workers` (default 8) MTProto senders run in parallel.
 - Telegram limits a document to 2 GiB (4 GiB with Premium); the tool validates this.
 - `session.txt` grants full access to the account. Keep it `0600` and out of backups you
   upload with the same account.

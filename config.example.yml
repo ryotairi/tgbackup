@@ -22,6 +22,10 @@ prefix: tgbackup
 # and more to re-upload on failure. 2 GiB max for regular accounts.
 part_size: 268435456
 
+# Parallel MTProto workers used to upload one part (1..16; GramJS is unstable
+# above 16). Parts themselves are still uploaded sequentially.
+upload_workers: 8
+
 # zstd level (1..22). 10 is a good speed/size trade-off for backups.
 zstd_level: 10
 

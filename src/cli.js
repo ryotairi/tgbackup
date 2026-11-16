@@ -5,7 +5,7 @@ const path = require('node:path');
 
 const { runBackup } = require('./backup');
 const cleanup = require('./cleanup');
-const { loadConfig, normalizeProxy, normalizeUploadDelay } = require('./config');
+const { loadConfig, normalizeProxy, normalizeUploadDelay, normalizeUploadWorkers } = require('./config');
 const { runInit } = require('./init');
 const { log, protectStdout } = require('./log');
 const { runRestore } = require('./restore');
@@ -43,6 +43,7 @@ backup options:
   --part-size <size>    bytes or a suffix such as 128M / 1G (default from config)
   --zstd-level <1-22>   zstd compression level (default from config)
   --delay <min,max>     random delay in seconds between part uploads
+  --workers <1-16>      parallel upload workers per part (default 8)
   --token-out <file>    additionally write the token to a file (mode 0600)
   --keep-tmp            keep temporary part files
   --non-interactive     never prompt for a Telegram login
@@ -239,6 +240,8 @@ async function commandBackup(options, positionals) {
         zstdLevel:
             options.zstdLevel === undefined ? undefined : parseInteger(options.zstdLevel, '--zstd-level', 1, 22),
         uploadDelay: options.delay === undefined ? undefined : normalizeUploadDelay(parseDelay(options.delay)),
+        uploadWorkers:
+            options.workers === undefined ? undefined : normalizeUploadWorkers(options.workers, '--workers'),
         tokenOut: options.tokenOut === undefined ? undefined : requireValue(options.tokenOut, '--token-out'),
         keepTmp: Boolean(options.keepTmp),
         interactive: !options.nonInteractive,

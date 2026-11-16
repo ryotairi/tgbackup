@@ -12,6 +12,8 @@ const PART_LIMIT_PREMIUM = 4 * 1024 ** 3 - 1; // Telegram Premium: 4 GiB
 const MIN_PART_SIZE = 64 * 1024;
 const DEFAULT_PART_SIZE = 256 * 1024 * 1024;
 const DEFAULT_ZSTD_LEVEL = 10;
+const DEFAULT_UPLOAD_WORKERS = 8;
+const MAX_UPLOAD_WORKERS = 16;
 
 const CONFIG_FILENAMES = ['config.yml', 'config.yaml', 'tgbackup.yml', 'tgbackup.yaml'];
 
@@ -139,6 +141,14 @@ function normalizeUploadDelay(value) {
     return { minMs: Math.round(min * 1000), maxMs: Math.round(max * 1000) };
 }
 
+function normalizeUploadWorkers(value, label = 'upload_workers') {
+    const workers = Number(value ?? DEFAULT_UPLOAD_WORKERS);
+    if (!Number.isInteger(workers) || workers < 1 || workers > MAX_UPLOAD_WORKERS) {
+        throw new UsageError(`${label} must be an integer between 1 and ${MAX_UPLOAD_WORKERS}`);
+    }
+    return workers;
+}
+
 function normalizeConfig(raw, { configPath, baseDir }) {
     if (raw !== null && (typeof raw !== 'object' || Array.isArray(raw))) {
         throw new UsageError('config root must be a YAML mapping');
@@ -178,6 +188,10 @@ function normalizeConfig(raw, { configPath, baseDir }) {
         throw new UsageError('zstd_level must be an integer between 1 and 22');
     }
 
+    const uploadWorkers = normalizeUploadWorkers(
+        envValue('TGBACKUP_UPLOAD_WORKERS') ?? data.upload_workers,
+    );
+
     const uploadDelay = normalizeUploadDelay(
         data.upload_delay === undefined
             ? {
@@ -207,6 +221,7 @@ function normalizeConfig(raw, { configPath, baseDir }) {
         prefix: String(envValue('TGBACKUP_PREFIX') ?? data.prefix ?? 'tgbackup'),
         partSize,
         zstdLevel,
+        uploadWorkers,
         uploadDelay,
         connectTimeoutMs: Math.round(connectTimeoutSeconds * 1000),
         premium,
@@ -234,11 +249,14 @@ function loadConfig(options = {}) {
 module.exports = {
     DEFAULT_PART_SIZE,
     DEFAULT_ZSTD_LEVEL,
+    DEFAULT_UPLOAD_WORKERS,
+    MAX_UPLOAD_WORKERS,
     PART_LIMIT_STANDARD,
     PART_LIMIT_PREMIUM,
     resolveConfigPath,
     normalizeProxy,
     normalizeUploadDelay,
+    normalizeUploadWorkers,
     normalizeConfig,
     loadConfig,
 };

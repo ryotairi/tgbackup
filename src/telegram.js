@@ -214,7 +214,7 @@ async function connect(config, options = {}) {
 }
 
 async function uploadDocument(client, options) {
-    const { target, filePath, fileName, size, caption, workers = 4, onProgress } = options;
+    const { target, filePath, fileName, size, caption, workers = 8, onProgress } = options;
 
     const input = await client.uploadFile({
         file: new CustomFile(fileName, size, filePath),

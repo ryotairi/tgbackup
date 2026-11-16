@@ -105,7 +105,11 @@ async function runRestore(config, options) {
             }
         }
 
-        await pipeline(Readable.from(decryptedParts()), createDecompressorStream(), createExtractStream(destination));
+        await pipeline(
+            Readable.from(decryptedParts(), { objectMode: false }),
+            createDecompressorStream(),
+            createExtractStream(destination),
+        );
     } finally {
         if (client) await closeClient(client);
         if (options.keepTmp) {

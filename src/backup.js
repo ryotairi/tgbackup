@@ -6,7 +6,7 @@ const path = require('node:path');
 
 const { createArchiveStream } = require('./archive');
 const cleanup = require('./cleanup');
-const { PART_LIMIT_PREMIUM, PART_LIMIT_STANDARD } = require('./config');
+const { DEFAULT_UPLOAD_WORKERS, PART_LIMIT_PREMIUM, PART_LIMIT_STANDARD } = require('./config');
 const { encryptBufferToFile } = require('./crypto');
 const { loadMasterKey } = require('./keys');
 const { createPercentProgress, log, warn } = require('./log');
@@ -33,6 +33,7 @@ async function runBackup(config, options) {
     const root = path.basename(targetPath);
     const partSize = options.partSize ?? config.partSize;
     const zstdLevel = options.zstdLevel ?? config.zstdLevel;
+    const uploadWorkers = options.uploadWorkers ?? config.uploadWorkers ?? DEFAULT_UPLOAD_WORKERS;
     const uploadDelay = options.uploadDelay ?? config.uploadDelay;
 
     const partLimit = config.premium ? PART_LIMIT_PREMIUM : PART_LIMIT_STANDARD;
@@ -63,7 +64,7 @@ async function runBackup(config, options) {
     let client;
 
     log(`backing up ${targetPath} as "${name}"`);
-    log(`zstd level ${zstdLevel}, ${formatBytes(partSize)} per part`);
+    log(`zstd level ${zstdLevel}, ${formatBytes(partSize)} per part, ${uploadWorkers} upload worker(s)`);
     if (config.proxy) log(`using SOCKS${config.proxy.type === 'socks4' ? '4' : '5'} proxy ${config.proxy.host}:${config.proxy.port}`);
 
     try {
@@ -100,7 +101,7 @@ async function runBackup(config, options) {
                                 fileName: `${slugify(name)}.part${String(index).padStart(5, '0')}.tgbk`,
                                 size,
                                 caption: `${config.prefix} ${name} [${index + 1}]`,
-                                workers: 4,
+                                workers: uploadWorkers,
                                 onProgress: (percent) => progress.update(percent),
                             });
                         },

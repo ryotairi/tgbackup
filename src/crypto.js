@@ -138,7 +138,7 @@ class FrameEncryptor extends Transform {
             this._pushHeader();
             this.queue.push(chunk);
             while (this.queue.length >= this.frameSize) {
-                this.push(this._encryptFrame(this.queue.take(this.frameSize)));
+                this._encryptFrame(this.queue.take(this.frameSize));
             }
             callback();
         } catch (error) {
@@ -150,7 +150,7 @@ class FrameEncryptor extends Transform {
         try {
             this._pushHeader();
             if (this.queue.length > 0) {
-                this.push(this._encryptFrame(this.queue.take(this.queue.length)));
+                this._encryptFrame(this.queue.take(this.queue.length));
             }
             callback();
         } catch (error) {
@@ -163,14 +163,19 @@ class FrameEncryptor extends Transform {
         this.counter += 1;
         const cipher = crypto.createCipheriv(ALGORITHM, this.key, nonce, { authTagLength: TAG_LENGTH });
         cipher.setAAD(this.header);
-        const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+        const ciphertext = cipher.update(plaintext);
+        const tail = cipher.final();
         const tag = cipher.getAuthTag();
-        const frame = Buffer.allocUnsafe(LENGTH_FIELD + NONCE_LENGTH + TAG_LENGTH + ciphertext.length);
-        frame.writeUInt32BE(plaintext.length, 0);
-        nonce.copy(frame, LENGTH_FIELD);
-        tag.copy(frame, LENGTH_FIELD + NONCE_LENGTH);
-        ciphertext.copy(frame, LENGTH_FIELD + NONCE_LENGTH + TAG_LENGTH);
-        return frame;
+
+        // Push the frame pieces separately: no file-sized (or even frame-sized)
+        // intermediate copy of the ciphertext is made here.
+        const lengthBytes = Buffer.allocUnsafe(LENGTH_FIELD);
+        lengthBytes.writeUInt32BE(plaintext.length, 0);
+        this.push(lengthBytes);
+        this.push(nonce);
+        this.push(tag);
+        this.push(ciphertext);
+        if (tail.length > 0) this.push(tail);
     }
 }
 
@@ -247,7 +252,9 @@ class FrameDecryptor extends Transform {
         const decipher = crypto.createDecipheriv(ALGORITHM, this.key, nonce, { authTagLength: TAG_LENGTH });
         decipher.setAAD(this.header);
         decipher.setAuthTag(tag);
-        const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+        const head = decipher.update(ciphertext);
+        const tail = decipher.final();
+        const plaintext = tail.length > 0 ? Buffer.concat([head, tail]) : head;
         if (plaintext.length !== length) throw new Error('corrupted part: frame length mismatch');
         return plaintext;
     }
@@ -271,7 +278,13 @@ async function encryptFile(inputPath, outputPath, keys, options = {}) {
 /** Same as encryptFile but for an in-memory buffer. */
 async function encryptBufferToFile(buffer, outputPath, keys, options = {}) {
     const stages = keys.map((key) => new FrameEncryptor(key, options));
-    await pipeline(Readable.from(bufferChunks(buffer)), ...stages, fs.createWriteStream(outputPath, { mode: 0o600 }));
+    // objectMode:false keeps the reader's high-water mark in bytes (16 KiB)
+    // instead of buffering 16 x 1 MiB chunk objects ahead of the encryptor.
+    await pipeline(
+        Readable.from(bufferChunks(buffer), { objectMode: false }),
+        ...stages,
+        fs.createWriteStream(outputPath, { mode: 0o600 }),
+    );
 }
 
 /** Reverse of encryptFile: layers are removed in reverse key order. */

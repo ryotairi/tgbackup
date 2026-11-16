@@ -48,6 +48,7 @@ test('backup -> token -> restore round-trip with a stubbed Telegram transport', 
     // Stub the Telegram transport before loading the commands.
     const telegramPath = require.resolve('../src/telegram');
     const stored = new Map();
+    const uploadCalls = [];
     let nextId = 215;
     require.cache[telegramPath] = {
         id: telegramPath,
@@ -59,6 +60,7 @@ test('backup -> token -> restore round-trip with a stubbed Telegram transport', 
             },
             async closeClient() {},
             async uploadDocument(_client, options) {
+                uploadCalls.push(options);
                 const destination = path.join(store, `message-${nextId}`);
                 fs.copyFileSync(options.filePath, destination);
                 const message = { id: nextId };
@@ -86,6 +88,7 @@ test('backup -> token -> restore round-trip with a stubbed Telegram transport', 
         prefix: 'test',
         partSize: 256 * 1024,
         zstdLevel: 3,
+        uploadWorkers: 3,
         uploadDelay: { minMs: 0, maxMs: 0 },
         premium: false,
         tmpDir,
@@ -102,6 +105,8 @@ test('backup -> token -> restore round-trip with a stubbed Telegram transport', 
     assert.ok(decoded.parts.length > 1, 'payload should span multiple parts');
     assert.equal(decoded.root, 'data');
     assert.equal(decoded.key.length, 32);
+    assert.ok(uploadCalls.length > 1);
+    assert.ok(uploadCalls.every((call) => call.workers === 3), 'configured upload workers must be passed through');
 
     const destination = path.join(work, 'restored');
     await runRestore(config, { token, out: destination, keepTmp: false, interactive: false });
