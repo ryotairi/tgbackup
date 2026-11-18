@@ -219,13 +219,17 @@ cat data.token | tgbackup restore - --out /srv/restore
 The archive contains the original target's basename, so backup of `/srv/data` restores to
 `<out>/data/...`.
 
-Downloads use AyuGram-style parallel fetching: the document is cut into 512 KiB chunks and
-`upload_workers` (default 8, 1–16) workers pull `upload.getFile` requests concurrently and
-write each chunk straight to disk at its offset — the whole file never sits in memory. The
-same tunable drives uploads and downloads; override for one restore with `--workers`:
+Downloads use AyuGram-style parallel fetching: the document is cut into 512 KiB chunks that
+are pulled with raw `upload.getFile` requests and written straight to disk at their offset —
+the whole file never sits in memory. Chunks run on `download_senders` **dedicated MTProto
+connections** (senders; each owns its own TCP congestion window, so lines do not fight for
+throughput — this is how desktop clients saturate a slow proxy), and every sender carries
+`download_workers_per_sender` concurrent chunk requests. Total parallel chunks are the
+product of the two (defaults: `4 x 2 = 8`). Both knobs are separate config options and
+overridable per restore:
 
 ```sh
-tgbackup restore '<token>' --out /srv/restore --workers 4
+tgbackup restore '<token>' --out /srv/restore --senders 6 --workers-per-sender 1
 ```
 
 `FLOOD_WAIT` throttles are honored automatically (GramJS sleeps waits up to 120 s internally,
@@ -274,6 +278,8 @@ master_key_file: ./master.key
 prefix: tgbackup
 part_size: 268435456            # 256 MiB
 upload_workers: 8               # parallel upload workers per part (1-16)
+download_senders: 4             # dedicated download connections per part (restore)
+download_workers_per_sender: 2  # parallel chunks per sender (total = senders x this)
 stage_archive: true             # pack first -> exact part count upfront
 zstd_level: 10
 upload_delay:
@@ -306,6 +312,7 @@ Handy for cron/containers:
 | `TGBACKUP_MASTER_KEY` | master secret (base64url/hex/passphrase), no file needed |
 | `TGBACKUP_MASTER_KEY_FILE`, `TGBACKUP_SESSION_FILE`, `TGBACKUP_TMP_DIR` | paths |
 | `TGBACKUP_PART_SIZE`, `TGBACKUP_ZSTD_LEVEL`, `TGBACKUP_UPLOAD_WORKERS`, `TGBACKUP_STAGE_ARCHIVE` | tuning |
+| `TGBACKUP_DOWNLOAD_SENDERS`, `TGBACKUP_DOWNLOAD_WORKERS_PER_SENDER` | restore download tuning |
 | `TGBACKUP_CONNECT_TIMEOUT` | MTProto connect timeout in seconds |
 | `TGBACKUP_DOWNLOAD_STALL_TIMEOUT` | restore watchdog seconds (retry a frozen download) |
 | `TGBACKUP_DELAY_MIN`, `TGBACKUP_DELAY_MAX` | upload delay seconds |
@@ -337,8 +344,9 @@ Each part is a self-describing container:
 - No resume: an interrupted backup leaves uploaded parts in the chat but no token. Delete
   them manually.
 - Parts are uploaded sequentially to stay predictable on Telegram rate limits; within one
-  part, up to `upload_workers` (default 8) MTProto senders run in parallel, and downloads
-  run up to `upload_workers` concurrent `upload.getFile` requests per part.
+  part, up to `upload_workers` (default 8) MTProto senders run in parallel, while restore
+  downloads use `download_senders` dedicated connections (default 4) with
+  `download_workers_per_sender` concurrent chunk requests each (default 2).
 - Telegram limits a document to 2 GiB (4 GiB with Premium); the tool validates this.
 - `session.txt` grants full access to the account. Keep it `0600` and out of backups you
   upload with the same account.

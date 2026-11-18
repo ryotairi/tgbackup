@@ -18,13 +18,21 @@ const fsp = require('node:fs/promises');
 const { log, warn } = require('./log');
 
 // Parallel chunk downloads (AyuGram-style): the document is cut into fixed
-// 512 KiB chunks and N workers run Api.upload.GetFile in parallel, writing
-// each chunk straight to disk at its file offset. 512 KiB satisfies the
-// Telegram constraint that offsets *and* limits are multiples of 4096 while
-// staying under the 0.75 MiB limit for large files at any size.
+// 512 KiB chunks fetched with Api.upload.GetFile and written straight to
+// disk at their file offset. 512 KiB satisfies the Telegram constraint that
+// offsets *and* limits are multiples of 4096 while staying under the
+// 0.75 MiB limit for large files at any size.
+//
+// Downloads run on `download_senders` *dedicated MTProto senders* (separate
+// MTProto connections, each owning its TCP congestion window — the way
+// desktop clients saturate a proxy) with `download_workers_per_sender`
+// concurrent GetFile requests per sender. Total parallel chunks is the
+// product of the two knobs.
 const DOWNLOAD_CHUNK_SIZE = 512 * 1024;
-const DEFAULT_DOWNLOAD_WORKERS = 8;
-const MAX_DOWNLOAD_WORKERS = 16;
+const DEFAULT_DOWNLOAD_SENDERS = 4;
+const MAX_DOWNLOAD_SENDERS = 8;
+const DEFAULT_DOWNLOAD_WORKERS_PER_SENDER = 2;
+const MAX_DOWNLOAD_WORKERS_PER_SENDER = 8;
 /** Honor server-imposed FLOOD_WAIT waits up to this long, fail beyond it. */
 const FLOOD_WAIT_CAP_SECONDS = 300;
 /** Transient failures tolerated per chunk before aborting the part. */
@@ -264,17 +272,26 @@ function extractDocument(message, messageId) {
 }
 
 /**
- * Downloads a document with N parallel workers using raw Api.upload.GetFile
- * requests (instead of GramJS' sequential downloadMedia): each worker pulls
- * the next 512 KiB offset from a shared queue, fetches the chunk and writes
- * it directly to disk at that offset via a file-handle pwrite, so the whole
- * file never sits in memory and out-of-order chunks are fine.
+ * Downloads a document with raw Api.upload.GetFile requests (instead of
+ * GramJS' sequential downloadMedia): `senders` dedicated MTProto senders
+ * (separate connections, each with its own TCP congestion window) each run
+ * `workersPerSender` concurrent chunk workers; workers pull the next
+ * 512 KiB offset from a shared queue and write chunks straight to disk at
+ * their offsets via a file-handle pwrite, so the file never sits in memory
+ * and out-of-order chunks are fine.
  */
 async function downloadDocument(client, options) {
     const { target, messageId, outputPath, onProgress, stallTimeoutMs } = options;
-    const workers = Math.max(
+    const sendersCount = Math.max(
         1,
-        Math.min(MAX_DOWNLOAD_WORKERS, Number(options.workers) || DEFAULT_DOWNLOAD_WORKERS),
+        Math.min(MAX_DOWNLOAD_SENDERS, Number(options.senders) || DEFAULT_DOWNLOAD_SENDERS),
+    );
+    const perSender = Math.max(
+        1,
+        Math.min(
+            MAX_DOWNLOAD_WORKERS_PER_SENDER,
+            Number(options.workersPerSender) || DEFAULT_DOWNLOAD_WORKERS_PER_SENDER,
+        ),
     );
 
     // A previous attempt may have disconnected the senders after a stall.
@@ -313,10 +330,10 @@ async function downloadDocument(client, options) {
         fileReference: doc.fileReference || Buffer.alloc(0),
         thumbSize: '', // the document itself, not a thumbnail
     });
-    // The document may live in another data center; getSender() borrows an
-    // authorized sender for that DC (undefined = reuse the main sender). A
-    // FileMigrateError updates it on the fly.
-    let dcId = doc.dcId === undefined || doc.dcId === null ? undefined : Number(doc.dcId);
+    // Until the document's DC is known (very old media without dcId) all
+    // slots alias the main client sender; a FileMigrateError moves the whole
+    // pool to dedicated senders in the right data center.
+    let poolDc = doc.dcId === undefined || doc.dcId === null ? undefined : Number(doc.dcId);
 
     // Out-of-order writes land straight on disk at their file offset; the
     // file is pre-truncated so the final size is already correct (sparse).
@@ -336,11 +353,122 @@ async function downloadDocument(client, options) {
     let cursor = 0; // shared offset queue; claiming is synchronous → atomic
     let completedBytes = 0;
     let lastActivity = Date.now();
-    let activeSender;
     const watchdogFired = { value: false };
 
-    // Sleep while refreshing lastActivity so a server-ordered wait is not
-    // mistaken for a stalled connection by the watchdog below.
+    const quietDisconnect = (sender) =>
+        sender && typeof sender.disconnect === 'function'
+            ? Promise.resolve(sender.disconnect()).catch(() => {})
+            : Promise.resolve();
+
+    // ---- sender pool ----
+    // gramjs caches exactly one sender per DC (_borrowExportedSender), so a
+    // multi-line pool is assembled here from the same internals and closed
+    // manually — manually created senders have no release timer.
+    let pool = [];
+    let poolOwned = false; // false → every slot aliases the main client sender
+    let poolBuiltDc = undefined;
+    let poolBuilt = false;
+    let building = null;
+
+    async function openSender(dc) {
+        const sender = client._createExportedSender(dc);
+        try {
+            // Exports the authorization for foreign DCs and connects through
+            // the very same proxy the client uses.
+            await client._connectSender(sender, dc);
+        } catch (error) {
+            await quietDisconnect(sender);
+            throw error;
+        }
+        return sender;
+    }
+
+    async function buildPool(dc) {
+        const fresh = [];
+        let freshOwned = false;
+        try {
+            if (dc === undefined) {
+                // Unknown DC: all slots share the client's main sender.
+                const shared = await client.getSender(undefined);
+                for (let i = 0; i < sendersCount; i += 1) fresh.push(shared);
+            } else {
+                freshOwned = true;
+                // Sequential on purpose: gramjs' _connectSender mutates the
+                // shared _initRequest while exporting auth, so parallel
+                // inits could interleave with the main client's requests.
+                for (let i = 0; i < sendersCount; i += 1) {
+                    fresh.push(await openSender(dc));
+                    lastActivity = Date.now(); // connecting counts as activity
+                }
+            }
+        } catch (error) {
+            if (freshOwned) await Promise.allSettled(fresh.map(quietDisconnect));
+            throw error;
+        }
+        // Swap the pool first, then retire the old owned senders, so a
+        // failed build never leaves the workers without a usable pool.
+        const retired = poolOwned ? pool.slice() : [];
+        pool = fresh;
+        poolOwned = freshOwned;
+        poolBuiltDc = dc;
+        poolBuilt = true;
+        await Promise.allSettled(retired.map(quietDisconnect));
+        return pool;
+    }
+
+    async function currentPool() {
+        for (;;) {
+            if (building !== null) {
+                await building; // build errors surface as transient failures
+                continue; // re-check afterwards (the DC may have moved on)
+            }
+            if (poolBuilt && poolBuiltDc === poolDc) return pool;
+            building = buildPool(poolDc).finally(() => {
+                building = null;
+            });
+            await building;
+        }
+    }
+
+    // A dead line is replaced per slot; perSender workers share a slot and
+    // therefore wait on the same replacement promise instead of racing.
+    const slotJobs = new Map();
+
+    async function senderForSlot(slot) {
+        const poolNow = await currentPool();
+        const index = slot % poolNow.length;
+        const sender = poolNow[index];
+        if (sender && typeof sender.isConnected === 'function' && sender.isConnected()) return sender;
+        if (slotJobs.has(index)) return slotJobs.get(index);
+        const job = (async () => {
+            if (poolOwned && poolDc !== undefined) {
+                const fresh = await openSender(poolDc);
+                if (poolNow === pool) {
+                    const old = pool[index];
+                    pool[index] = fresh;
+                    await quietDisconnect(old);
+                }
+                return fresh;
+            }
+            // Aliased main sender: revive the client itself.
+            if (client.disconnected) {
+                try {
+                    await client.connect();
+                } catch {
+                    /* the invoke below fails and retries */
+                }
+            }
+            return poolNow[index];
+        })().finally(() => slotJobs.delete(index));
+        slotJobs.set(index, job);
+        return job;
+    }
+
+    /**
+     * Sleep while refreshing lastActivity so a server-ordered wait is not
+     * mistaken for a stalled connection by the watchdog below.
+     * @param {number} ms
+     */
     async function sleepKeepingActivity(ms) {
         for (let done = 0; done < ms; done += 1000) {
             lastActivity = Date.now();
@@ -348,16 +476,13 @@ async function downloadDocument(client, options) {
         }
     }
 
-    async function fetchChunk(offset, expected) {
+    async function fetchChunk(slot, offset, expected) {
         let floodRetries = 0;
         let migrations = 0;
         for (let attempt = 1; ; attempt += 1) {
             if (fatal) throw fatal;
             try {
-                // Mirror GramJS' DirectDownloadIter: re-borrow the sender for
-                // every request so a broken/released sender is re-established.
-                const sender = await client.getSender(dcId);
-                activeSender = sender;
+                const sender = await senderForSlot(slot);
                 const result = await client.invokeWithSender(
                     new Api.upload.GetFile({ location, offset, limit: DOWNLOAD_CHUNK_SIZE }),
                     sender,
@@ -380,8 +505,8 @@ async function downloadDocument(client, options) {
                     if (++migrations > MAX_DC_MIGRATIONS) {
                         throw new Error('the document keeps migrating between data centers');
                     }
-                    dcId = error.newDc;
-                    continue; // borrow into the right DC immediately
+                    poolDc = error.newDc; // the next chunk rebuilds the pool there
+                    continue;
                 }
                 if (error instanceof errors.FloodWaitError) {
                     const seconds = Number(error.seconds) || 0;
@@ -405,7 +530,7 @@ async function downloadDocument(client, options) {
         }
     }
 
-    async function worker() {
+    async function worker(slot) {
         try {
             for (;;) {
                 if (fatal) return;
@@ -414,7 +539,7 @@ async function downloadDocument(client, options) {
                 cursor = offset + DOWNLOAD_CHUNK_SIZE;
 
                 const expected = Math.min(DOWNLOAD_CHUNK_SIZE, size - offset);
-                const bytes = await fetchChunk(offset, expected);
+                const bytes = await fetchChunk(slot, offset, expected);
                 if (fatal) return;
                 const written = await file.write(bytes, 0, bytes.length, offset);
                 if (written.bytesWritten !== bytes.length) {
@@ -462,21 +587,23 @@ async function downloadDocument(client, options) {
     try {
         await file.truncate(size);
 
-        const pool = Promise.all(Array.from({ length: workers }, worker));
-        pool.catch(() => {}); // worker errors land in `fatal`, never unhandled
+        const workerPool = Promise.all(
+            Array.from(
+                { length: sendersCount * perSender },
+                (_value, index) => worker(index % sendersCount),
+            ),
+        );
+        workerPool.catch(() => {}); // worker errors land in `fatal`, never unhandled
 
         try {
-            await Promise.race([pool, watchdog]);
+            await Promise.race([workerPool, watchdog]);
         } catch (error) {
             if (!watchdogFired.value) throw error;
-            // Watchdog fired: kill every socket involved immediately (the
-            // main client alone may not own the DC sender the workers use),
-            // then fail so the caller retries the whole part from scratch.
-            const kills = [];
-            if (typeof client.disconnect === 'function') kills.push(client.disconnect());
-            if (activeSender && typeof activeSender.disconnect === 'function') {
-                kills.push(activeSender.disconnect());
-            }
+            // Watchdog fired: kill every socket involved (the main client
+            // plus every dedicated line the pool owns), then fail so the
+            // caller retries the whole part from scratch.
+            const kills = [client.disconnect()];
+            if (poolOwned) for (const sender of pool) kills.push(quietDisconnect(sender));
             for (const kill of kills) {
                 try {
                     await Promise.race([Promise.resolve(kill).catch(() => {}), sleep(5000)]);
@@ -497,6 +624,11 @@ async function downloadDocument(client, options) {
         return message;
     } finally {
         if (timer) clearInterval(timer);
+        const pendingBuild = building;
+        if (pendingBuild) {
+            await Promise.race([pendingBuild.catch(() => {}), sleep(10000)]);
+        }
+        if (poolOwned) await Promise.allSettled(pool.map(quietDisconnect));
         await closeFile();
         if (watchdogFired.value) {
             try {
@@ -520,4 +652,8 @@ module.exports = {
     downloadDocument,
     closeClient,
     DOWNLOAD_CHUNK_SIZE,
+    DEFAULT_DOWNLOAD_SENDERS,
+    MAX_DOWNLOAD_SENDERS,
+    DEFAULT_DOWNLOAD_WORKERS_PER_SENDER,
+    MAX_DOWNLOAD_WORKERS_PER_SENDER,
 };

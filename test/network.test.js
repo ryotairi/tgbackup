@@ -63,6 +63,25 @@ function stubMessage(size, dcId) {
     };
 }
 
+/** Stub helpers for the manual sender pool (created via gramjs internals). */
+function poolStubs() {
+    const created = { list: [], disconnects: 0 };
+    return {
+        created,
+        _createExportedSender(dcId) {
+            created.list.push(dcId);
+            return {
+                dcId,
+                isConnected: () => true,
+                async disconnect() {
+                    created.disconnects += 1;
+                },
+            };
+        },
+        async _connectSender(_sender, _dcId) {},
+    };
+}
+
 test('downloadDocument pulls 512 KiB chunks in parallel and writes them at their offsets', async () => {
     const fs = require('node:fs');
     const os = require('node:os');
@@ -77,17 +96,15 @@ test('downloadDocument pulls 512 KiB chunks in parallel and writes them at their
         async getMessages() {
             return [stubMessage(SIZE, 2)];
         },
-        async getSender() {
-            return { dcId: 2 };
-        },
-        async invokeWithSender(request) {
-            seenRequests.push(request);
+        async invokeWithSender(request, sender) {
+            seenRequests.push({ request, sender });
             const offset = Number(request.offset);
             const length = Math.min(CHUNK, SIZE - offset);
             const chunk = offset / CHUNK;
             return { bytes: Buffer.alloc(length, chunk + 1) }; // fill byte marks the chunk index
         },
         async disconnect() {},
+        ...poolStubs(),
     };
 
     const progress = [];
@@ -95,19 +112,22 @@ test('downloadDocument pulls 512 KiB chunks in parallel and writes them at their
         target: '-1001',
         messageId: 11,
         outputPath,
-        workers: 2,
+        senders: 2,
+        workersPerSender: 2,
         onProgress: (received, total) => progress.push([received, total]),
     });
 
+    assert.deepEqual(client.created.list, [2, 2], 'senders options requests one dedicated sender per line');
+    assert.equal(client.created.disconnects, 2, 'owned senders must be disconnected after the download');
     assert.equal(fs.statSync(outputPath).size, SIZE, 'the file must be exactly the document size');
-    for (const request of seenRequests) {
-        assert.equal(request.limit, CHUNK, 'every GetFile request must use the 512 KiB chunk size');
-    }
     assert.deepEqual(
-        seenRequests.map((request) => Number(request.offset)).sort((a, b) => a - b),
+        seenRequests.map((entry) => Number(entry.request.offset)).sort((a, b) => a - b),
         [0, CHUNK, 2 * CHUNK],
         'chunks must cover the document from offset 0 with a shared queue',
     );
+    for (const { request } of seenRequests) {
+        assert.equal(request.limit, CHUNK, 'every GetFile request must use the 512 KiB chunk size');
+    }
 
     const fd = fs.openSync(outputPath, 'r');
     try {
@@ -138,10 +158,7 @@ test('downloadDocument handles FLOOD_WAIT by sleeping and retrying the chunk', a
         async getMessages() {
             return [stubMessage(CHUNK, 2)];
         },
-        async getSender() {
-            return { dcId: 2 };
-        },
-        async invokeWithSender(request) {
+        async invokeWithSender() {
             attempts += 1;
             if (attempts === 1) {
                 throw Object.assign(new errors.FloodWaitError({}), { seconds: 1 });
@@ -149,16 +166,25 @@ test('downloadDocument handles FLOOD_WAIT by sleeping and retrying the chunk', a
             return { bytes: Buffer.alloc(CHUNK, 7) };
         },
         async disconnect() {},
+        ...poolStubs(),
     };
 
-    await downloadDocument(client, { target: '-1001', messageId: 12, outputPath, workers: 1 });
+    await downloadDocument(client, {
+        target: '-1001',
+        messageId: 12,
+        outputPath,
+        senders: 1,
+        workersPerSender: 1,
+    });
 
+    assert.deepEqual(client.created.list, [2], 'one dedicated sender for senders: 1');
     assert.equal(attempts, 2, 'the flooded chunk must be retried after the wait');
     assert.equal(fs.statSync(outputPath).size, CHUNK);
+    assert.equal(client.created.disconnects, 1, 'the sender must be released afterwards');
     fs.rmSync(work, { recursive: true, force: true });
 });
 
-test('downloadDocument follows FileMigrateError and borrows a sender for the new DC', async () => {
+test('downloadDocument follows FileMigrateError and rebuilds the pool in the new DC', async () => {
     const fs = require('node:fs');
     const os = require('node:os');
     const path = require('node:path');
@@ -166,19 +192,26 @@ test('downloadDocument follows FileMigrateError and borrows a sender for the new
     const work = fs.mkdtempSync(path.join(os.tmpdir(), 'tg-migrate-'));
     const outputPath = path.join(work, 'part.enc');
 
+    // the media predates the dc_id field, so the DC is unknown at first and
+    // the chunks start on the main client sender
     const borrowedDcs = [];
+    const invokedWith = [];
     let migrated = false;
     const client = {
         disconnected: false,
-        // the media predates the dc_id field, so the DC is unknown at first
         async getMessages() {
             return [stubMessage(CHUNK, undefined)];
         },
         async getSender(dcId) {
             borrowedDcs.push(dcId);
-            return { dcId };
+            return {
+                dcId,
+                isConnected: () => true,
+                async disconnect() {},
+            };
         },
-        async invokeWithSender(request) {
+        async invokeWithSender(_request, sender) {
+            invokedWith.push(sender.dcId);
             if (!migrated) {
                 migrated = true;
                 throw Object.assign(new errors.FileMigrateError({}), { newDc: 4 });
@@ -186,11 +219,22 @@ test('downloadDocument follows FileMigrateError and borrows a sender for the new
             return { bytes: Buffer.alloc(CHUNK, 9) };
         },
         async disconnect() {},
+        ...poolStubs(),
     };
 
-    await downloadDocument(client, { target: '-1001', messageId: 13, outputPath });
+    await downloadDocument(client, {
+        target: '-1001',
+        messageId: 13,
+        outputPath,
+        senders: 2,
+        workersPerSender: 1,
+    });
 
-    assert.deepEqual(borrowedDcs, [undefined, 4], 'must re-borrow the sender into the migrated DC');
+    assert.deepEqual(borrowedDcs, [undefined], 'the first chunks must ride the main sender (unknown DC)');
+    // one chunk only: the worker retries it on a dedicated sender in DC 4
+    assert.deepEqual(invokedWith, [undefined, 4], 'must move to dedicated senders in the migrated DC');
+    assert.deepEqual(client.created.list, [4, 4], 'the pool must be rebuilt in DC 4');
+    assert.equal(client.created.disconnects, 2, 'the rebuilt senders must be released afterwards');
     assert.equal(fs.statSync(outputPath).size, CHUNK);
     fs.rmSync(work, { recursive: true, force: true });
 });
@@ -204,7 +248,6 @@ test('downloadDocument kills a stalled download, disconnects senders and removes
 
     let connectedCalled = 0;
     let disconnectedCalled = 0;
-    let senderDisconnects = 0;
     const client = {
         disconnected: true, // simulate a previous stall having killed the senders
         async connect() {
@@ -213,33 +256,30 @@ test('downloadDocument kills a stalled download, disconnects senders and removes
         async getMessages() {
             return [stubMessage(CHUNK, 2)];
         },
-        async getSender() {
-            return {
-                dcId: 2,
-                disconnect: () => {
-                    senderDisconnects += 1;
-                },
-            };
-        },
         async invokeWithSender() {
             return new Promise(() => {}); // never finishes; watchdog must fire
         },
         async disconnect() {
             disconnectedCalled += 1;
         },
+        ...poolStubs(),
     };
 
     const watchdog = downloadDocument(client, {
         target: '-1001',
         messageId: 7,
         outputPath,
-        workers: 2,
+        senders: 2,
+        workersPerSender: 1,
         stallTimeoutMs: 60, // tiny so the test is fast (checked every ~50ms)
     });
     await assert.rejects(watchdog, /download stalled/);
     assert.equal(connectedCalled, 1, 'must reconnect before starting the download');
     assert.equal(disconnectedCalled, 1, 'the client must be killed after a stall');
-    assert.ok(senderDisconnects >= 1, 'the DC sender used by workers must also be killed');
+    assert.deepEqual(client.created.list, [2, 2], 'two dedicated senders must be created');
+    // kill path releases the pool; the cleanup afterwards double-releases
+    // the dead senders (gramjs tolerates repeat disconnects)
+    assert.ok(client.created.disconnects >= 2, 'the owned senders must also be killed');
     assert.ok(!fs.existsSync(outputPath), 'partial file must be removed');
     fs.rmSync(work, { recursive: true, force: true });
 });

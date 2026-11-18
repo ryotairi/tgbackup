@@ -44,11 +44,16 @@ async function runRestore(config, options) {
         Number.isFinite(config.downloadStallMs) && config.downloadStallMs >= 0
             ? config.downloadStallMs
             : DEFAULT_DOWNLOAD_STALL_SECONDS * 1000;
-    // The same tunable drives parallel uploads and parallel downloads; a
-    // `--workers` flag on restore overrides the config value.
-    const downloadWorkers = Number.isInteger(options.workers) && options.workers >= 1
-        ? options.workers
-        : config.uploadWorkers;
+    // Downloads use their own tuning: `download_senders` dedicated connections
+    // carrying `download_workers_per_sender` parallel chunk requests each.
+    // The flags on restore override the config values.
+    const downloadSenders = Number.isInteger(options.senders) && options.senders >= 1
+        ? options.senders
+        : config.downloadSenders;
+    const downloadWorkersPerSender =
+        Number.isInteger(options.workersPerSender) && options.workersPerSender >= 1
+            ? options.workersPerSender
+            : config.downloadWorkersPerSender;
 
     const destination = path.resolve(options.out || `restore-${slugify(token.name)}`);
     fs.mkdirSync(destination, { recursive: true, mode: 0o700 });
@@ -70,7 +75,8 @@ async function runRestore(config, options) {
             (stallTimeoutMs === 0 ? ' (disabled)' : ''),
     );
     log(
-        `download plan: ${downloadWorkers} parallel workers, ${formatBytes(DOWNLOAD_CHUNK_SIZE)} chunks per part`,
+        `download plan: ${downloadSenders} sender line(s) x ${downloadWorkersPerSender} worker(s) per line ` +
+            `(${downloadSenders * downloadWorkersPerSender} parallel chunks, ${formatBytes(DOWNLOAD_CHUNK_SIZE)} each)`,
     );
     if (token.createdAt) log(`created at ${token.createdAt}`);
     if (config.proxy) log(`using SOCKS${config.proxy.type === 'socks4' ? '4' : '5'} proxy ${config.proxy.host}:${config.proxy.port}`);
@@ -109,7 +115,8 @@ async function runRestore(config, options) {
                                 messageId: part.id,
                                 outputPath: encryptedPath,
                                 stallTimeoutMs,
-                                workers: downloadWorkers,
+                                senders: downloadSenders,
+                                workersPerSender: downloadWorkersPerSender,
                                 onProgress: (received, total) =>
                                     progress.update(received, total || part.size),
                             });

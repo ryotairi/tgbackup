@@ -14,6 +14,12 @@ const DEFAULT_PART_SIZE = 256 * 1024 * 1024;
 const DEFAULT_ZSTD_LEVEL = 10;
 const DEFAULT_UPLOAD_WORKERS = 8;
 const MAX_UPLOAD_WORKERS = 16;
+/** Dedicated download connections (senders) during restore. */
+const DEFAULT_DOWNLOAD_SENDERS = 4;
+const MAX_DOWNLOAD_SENDERS = 8;
+/** Concurrent chunk requests carried by one download sender. */
+const DEFAULT_DOWNLOAD_WORKERS_PER_SENDER = 2;
+const MAX_DOWNLOAD_WORKERS_PER_SENDER = 8;
 /** Kill and retry a download that stops receiving data for this long (seconds). */
 const DEFAULT_DOWNLOAD_STALL_SECONDS = 300;
 
@@ -152,6 +158,30 @@ function normalizeUploadWorkers(value, label = 'upload_workers') {
     return workers;
 }
 
+function normalizeWorkerCount(value, label, { min, max, fallback }) {
+    const count = Number(value ?? fallback);
+    if (!Number.isInteger(count) || count < min || count > max) {
+        throw new UsageError(`${label} must be an integer between ${min} and ${max}`);
+    }
+    return count;
+}
+
+function normalizeDownloadSenders(value) {
+    return normalizeWorkerCount(
+        value,
+        'download_senders',
+        { min: 1, max: MAX_DOWNLOAD_SENDERS, fallback: DEFAULT_DOWNLOAD_SENDERS },
+    );
+}
+
+function normalizeDownloadWorkersPerSender(value) {
+    return normalizeWorkerCount(
+        value,
+        'download_workers_per_sender',
+        { min: 1, max: MAX_DOWNLOAD_WORKERS_PER_SENDER, fallback: DEFAULT_DOWNLOAD_WORKERS_PER_SENDER },
+    );
+}
+
 function normalizeBooleanish(value, label, fallback) {
     if (value === undefined || value === null) return fallback;
     if (typeof value === 'boolean') return value;
@@ -204,6 +234,13 @@ function normalizeConfig(raw, { configPath, baseDir }) {
         envValue('TGBACKUP_UPLOAD_WORKERS') ?? data.upload_workers,
     );
 
+    const downloadSenders = normalizeDownloadSenders(
+        envValue('TGBACKUP_DOWNLOAD_SENDERS') ?? data.download_senders,
+    );
+    const downloadWorkersPerSender = normalizeDownloadWorkersPerSender(
+        envValue('TGBACKUP_DOWNLOAD_WORKERS_PER_SENDER') ?? data.download_workers_per_sender,
+    );
+
     const stageArchive = normalizeBooleanish(
         envValue('TGBACKUP_STAGE_ARCHIVE') ?? data.stage_archive,
         'stage_archive',
@@ -249,6 +286,8 @@ function normalizeConfig(raw, { configPath, baseDir }) {
         partSize,
         zstdLevel,
         uploadWorkers,
+        downloadSenders,
+        downloadWorkersPerSender,
         stageArchive,
         uploadDelay,
         connectTimeoutMs: Math.round(connectTimeoutSeconds * 1000),
@@ -280,13 +319,20 @@ module.exports = {
     DEFAULT_ZSTD_LEVEL,
     DEFAULT_UPLOAD_WORKERS,
     DEFAULT_DOWNLOAD_STALL_SECONDS,
+    DEFAULT_DOWNLOAD_SENDERS,
+    DEFAULT_DOWNLOAD_WORKERS_PER_SENDER,
     MAX_UPLOAD_WORKERS,
+    MAX_DOWNLOAD_SENDERS,
+    MAX_DOWNLOAD_WORKERS_PER_SENDER,
     PART_LIMIT_STANDARD,
     PART_LIMIT_PREMIUM,
     resolveConfigPath,
     normalizeProxy,
     normalizeUploadDelay,
     normalizeUploadWorkers,
+    normalizeWorkerCount,
+    normalizeDownloadSenders,
+    normalizeDownloadWorkersPerSender,
     normalizeConfig,
     loadConfig,
 };

@@ -23,9 +23,15 @@ prefix: tgbackup
 part_size: 268435456
 
 # Parallel MTProto workers used to upload one part (1..16; GramJS is unstable
-# above 16). Parts themselves are still uploaded sequentially. The same count
-# drives parallel chunk downloads during restore (override with --workers).
+# above 16). Parts themselves are still uploaded sequentially.
 upload_workers: 8
+
+# Restore downloads run on dedicated MTProto connections ("senders" — each is
+# its own TCP connection, so lines do not share one congestion window), and
+# every sender carries download_workers_per_sender parallel chunk requests.
+# Total parallel chunks = download_senders * download_workers_per_sender.
+download_senders: 4                # 1..8
+download_workers_per_sender: 2     # 1..8
 
 # Pack the whole archive to tmp_dir before uploading anything. Costs archive-
 # sized disk space there, but shows the exact part count upfront and captions

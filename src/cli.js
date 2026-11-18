@@ -5,7 +5,18 @@ const path = require('node:path');
 
 const { runBackup } = require('./backup');
 const cleanup = require('./cleanup');
-const { loadConfig, normalizeProxy, normalizeUploadDelay, normalizeUploadWorkers } = require('./config');
+const {
+    DEFAULT_DOWNLOAD_SENDERS,
+    DEFAULT_DOWNLOAD_WORKERS_PER_SENDER,
+    MAX_DOWNLOAD_SENDERS,
+    MAX_DOWNLOAD_WORKERS_PER_SENDER,
+    loadConfig,
+    normalizeDownloadSenders,
+    normalizeDownloadWorkersPerSender,
+    normalizeProxy,
+    normalizeUploadDelay,
+    normalizeUploadWorkers,
+} = require('./config');
 const { runInit } = require('./init');
 const { log, protectStdout } = require('./log');
 const { runRestore } = require('./restore');
@@ -51,7 +62,9 @@ backup options:
 
 restore options:
   --out <dir>           restore destination (default: ./restore-<name>)
-  --workers <1-16>      parallel download workers per part (default from upload_workers)
+  --senders <1-8>       dedicated download connections per part (default from download_senders)
+  --workers-per-sender <1-8>
+                        parallel chunks per sender (total = senders x this)
   --token-file <file>   read the token from a file instead of the argument
   --keep-tmp            keep temporary part files
   --non-interactive     never prompt for a Telegram login
@@ -260,8 +273,11 @@ async function commandRestore(options, positionals) {
     await runRestore(config, {
         token,
         out: options.out === undefined ? undefined : requireValue(options.out, '--out'),
-        workers:
-            options.workers === undefined ? undefined : normalizeUploadWorkers(options.workers, '--workers'),
+        senders: options.senders === undefined ? undefined : normalizeDownloadSenders(options.senders),
+        workersPerSender:
+            options.workersPerSender === undefined
+                ? undefined
+                : normalizeDownloadWorkersPerSender(options.workersPerSender),
         keepTmp: Boolean(options.keepTmp),
         interactive: !options.nonInteractive,
     });

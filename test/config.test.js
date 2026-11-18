@@ -77,6 +77,32 @@ test('upload workers default to 8 and are limited to 1..16', () => {
     );
 });
 
+test('download senders and workers-per-sender default to 4x2 and are limited independently', () => {
+    const config = normalizeConfig(baseRaw, { configPath: '/tmp/dir/config.yml', baseDir: '/tmp/dir' });
+    assert.equal(config.downloadSenders, 4);
+    assert.equal(config.downloadWorkersPerSender, 2);
+
+    const custom = normalizeConfig(
+        { ...baseRaw, download_senders: 6, download_workers_per_sender: 1 },
+        { configPath: '/tmp/dir/config.yml', baseDir: '/tmp/dir' },
+    );
+    assert.equal(custom.downloadSenders, 6);
+    assert.equal(custom.downloadWorkersPerSender, 1);
+
+    assert.throws(
+        () => normalizeConfig({ ...baseRaw, download_senders: 9 }, { configPath: '/tmp/x', baseDir: '/tmp' }),
+        /download_senders must be an integer between 1 and 8/,
+    );
+    assert.throws(
+        () =>
+            normalizeConfig(
+                { ...baseRaw, download_workers_per_sender: 0 },
+                { configPath: '/tmp/x', baseDir: '/tmp' },
+            ),
+        /download_workers_per_sender must be an integer between 1 and 8/,
+    );
+});
+
 test('config exposes resolved paths and defaults', () => {
     const config = normalizeConfig(baseRaw, { configPath: '/tmp/dir/config.yml', baseDir: '/tmp/dir' });
     assert.equal(config.partSize, 256 * 1024 * 1024);
