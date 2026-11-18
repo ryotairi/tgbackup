@@ -6,7 +6,7 @@ const path = require('node:path');
 const readline = require('node:readline/promises');
 const { setTimeout: sleep } = require('node:timers/promises');
 
-const { TelegramClient } = require('telegram');
+const { Api, TelegramClient, errors } = require('telegram');
 const { StringSession } = require('telegram/sessions');
 const { Logger } = require('telegram/extensions');
 const { LogLevel } = require('telegram/extensions/Logger');
@@ -14,7 +14,24 @@ const { CustomFile } = require('telegram/client/uploads');
 const qrcode = require('qrcode-terminal');
 
 const { UsageError, ensureDir, warnIfLoosePermissions } = require('./util');
+const fsp = require('node:fs/promises');
 const { log, warn } = require('./log');
+
+// Parallel chunk downloads (AyuGram-style): the document is cut into fixed
+// 512 KiB chunks and N workers run Api.upload.GetFile in parallel, writing
+// each chunk straight to disk at its file offset. 512 KiB satisfies the
+// Telegram constraint that offsets *and* limits are multiples of 4096 while
+// staying under the 0.75 MiB limit for large files at any size.
+const DOWNLOAD_CHUNK_SIZE = 512 * 1024;
+const DEFAULT_DOWNLOAD_WORKERS = 8;
+const MAX_DOWNLOAD_WORKERS = 16;
+/** Honor server-imposed FLOOD_WAIT waits up to this long, fail beyond it. */
+const FLOOD_WAIT_CAP_SECONDS = 300;
+/** Transient failures tolerated per chunk before aborting the part. */
+const CHUNK_ATTEMPTS = 8;
+/** Safety caps so server quirks cannot loop forever. */
+const MAX_FLOOD_RETRIES = 20;
+const MAX_DC_MIGRATIONS = 4;
 
 function buildClientParams(config) {
     const params = {
@@ -237,8 +254,28 @@ async function uploadDocument(client, options) {
     return message;
 }
 
+function extractDocument(message, messageId) {
+    const media = message && message.media;
+    const doc = media && media.document;
+    if (!doc || doc.className === 'documentEmpty' || doc.id === undefined || doc.id === null) {
+        throw new Error(`message ${messageId} not found or has no document attached`);
+    }
+    return doc;
+}
+
+/**
+ * Downloads a document with N parallel workers using raw Api.upload.GetFile
+ * requests (instead of GramJS' sequential downloadMedia): each worker pulls
+ * the next 512 KiB offset from a shared queue, fetches the chunk and writes
+ * it directly to disk at that offset via a file-handle pwrite, so the whole
+ * file never sits in memory and out-of-order chunks are fine.
+ */
 async function downloadDocument(client, options) {
     const { target, messageId, outputPath, onProgress, stallTimeoutMs } = options;
+    const workers = Math.max(
+        1,
+        Math.min(MAX_DOWNLOAD_WORKERS, Number(options.workers) || DEFAULT_DOWNLOAD_WORKERS),
+    );
 
     // A previous attempt may have disconnected the senders after a stall.
     if (client.disconnected) {
@@ -255,74 +292,220 @@ async function downloadDocument(client, options) {
         throw new Error(`message ${messageId} not found or has no document attached`);
     }
 
-    const progressCallback = onProgress
-        ? (received, total) => {
-              // GramJS hands us big-integer instances here.
-              onProgress(Number(received), Number(total));
-          }
+    const doc = extractDocument(message, messageId);
+    const size = Number(doc.size);
+    if (!Number.isFinite(size) || size < 0) {
+        throw new Error(`message ${messageId} has a document without a known size`);
+    }
+    const onLocalProgress = onProgress
+        ? (received, total) => onProgress(Number(received), Number(total))
         : undefined;
 
-    if (!stallTimeoutMs || stallTimeoutMs <= 0) {
-        await client.downloadMedia(message, {
-            outputFile: outputPath,
-            progressCallback,
-        });
+    if (size === 0) {
+        await fsp.writeFile(outputPath, Buffer.alloc(0), { mode: 0o600 });
+        onLocalProgress?.(0, 0);
         return message;
     }
 
-    // Watchdog: if no data arrives for `stallTimeoutMs` (frozen proxy / dead
-    // datacenter connection), kill the senders and fail so the caller can
-    // retry the whole part from scratch instead of hanging forever.
+    const location = new Api.InputDocumentFileLocation({
+        id: doc.id,
+        accessHash: doc.accessHash,
+        fileReference: doc.fileReference || Buffer.alloc(0),
+        thumbSize: '', // the document itself, not a thumbnail
+    });
+    // The document may live in another data center; getSender() borrows an
+    // authorized sender for that DC (undefined = reuse the main sender). A
+    // FileMigrateError updates it on the fly.
+    let dcId = doc.dcId === undefined || doc.dcId === null ? undefined : Number(doc.dcId);
+
+    // Out-of-order writes land straight on disk at their file offset; the
+    // file is pre-truncated so the final size is already correct (sparse).
+    const file = await fsp.open(outputPath, 'w', 0o600);
+    const closed = { value: false };
+    const closeFile = async () => {
+        if (closed.value) return;
+        closed.value = true;
+        try {
+            await file.close();
+        } catch {
+            /* best effort */
+        }
+    };
+
+    let fatal = null;
+    let cursor = 0; // shared offset queue; claiming is synchronous → atomic
+    let completedBytes = 0;
     let lastActivity = Date.now();
-    let watchdogFired = false;
-    let rejectStall;
+    let activeSender;
+    const watchdogFired = { value: false };
+
+    // Sleep while refreshing lastActivity so a server-ordered wait is not
+    // mistaken for a stalled connection by the watchdog below.
+    async function sleepKeepingActivity(ms) {
+        for (let done = 0; done < ms; done += 1000) {
+            lastActivity = Date.now();
+            await sleep(Math.min(1000, ms - done));
+        }
+    }
+
+    async function fetchChunk(offset, expected) {
+        let floodRetries = 0;
+        let migrations = 0;
+        for (let attempt = 1; ; attempt += 1) {
+            if (fatal) throw fatal;
+            try {
+                // Mirror GramJS' DirectDownloadIter: re-borrow the sender for
+                // every request so a broken/released sender is re-established.
+                const sender = await client.getSender(dcId);
+                activeSender = sender;
+                const result = await client.invokeWithSender(
+                    new Api.upload.GetFile({ location, offset, limit: DOWNLOAD_CHUNK_SIZE }),
+                    sender,
+                );
+                if (result instanceof Api.upload.FileCdnRedirect) {
+                    throw new Error('Telegram served the document from a CDN, which tgbackup cannot fetch');
+                }
+                const bytes = result.bytes;
+                if (!bytes || bytes.length !== expected) {
+                    // A short read before the end of the file is a broken
+                    // response; retry the chunk instead of writing a hole.
+                    throw new Error(
+                        `server returned ${bytes ? bytes.length : 0} of ${expected} bytes at offset ${offset}`,
+                    );
+                }
+                return bytes;
+            } catch (error) {
+                if (fatal) throw fatal;
+                if (error instanceof errors.FileMigrateError) {
+                    if (++migrations > MAX_DC_MIGRATIONS) {
+                        throw new Error('the document keeps migrating between data centers');
+                    }
+                    dcId = error.newDc;
+                    continue; // borrow into the right DC immediately
+                }
+                if (error instanceof errors.FloodWaitError) {
+                    const seconds = Number(error.seconds) || 0;
+                    if (seconds > FLOOD_WAIT_CAP_SECONDS) {
+                        throw new Error(
+                            `server throttled the download: FLOOD_WAIT ${seconds}s exceeds ` +
+                                `tgbackup's ${FLOOD_WAIT_CAP_SECONDS}s cap; retry later`,
+                        );
+                    }
+                    if (++floodRetries > MAX_FLOOD_RETRIES) {
+                        throw new Error('the server keeps throttling the download (repeated FLOOD_WAIT)');
+                    }
+                    // Waits of up to 120 s are already slept by GramJS itself
+                    // (floodSleepThreshold); longer waits are honored here.
+                    if (seconds > 0) await sleepKeepingActivity(seconds * 1000);
+                    continue;
+                }
+                if (attempt >= CHUNK_ATTEMPTS) throw error;
+                await sleepKeepingActivity(Math.min(3000, 250 * attempt));
+            }
+        }
+    }
+
+    async function worker() {
+        try {
+            for (;;) {
+                if (fatal) return;
+                const offset = cursor;
+                if (offset >= size) return;
+                cursor = offset + DOWNLOAD_CHUNK_SIZE;
+
+                const expected = Math.min(DOWNLOAD_CHUNK_SIZE, size - offset);
+                const bytes = await fetchChunk(offset, expected);
+                if (fatal) return;
+                const written = await file.write(bytes, 0, bytes.length, offset);
+                if (written.bytesWritten !== bytes.length) {
+                    throw new Error(
+                        `short write at offset ${offset} (${written.bytesWritten}/${bytes.length} bytes); is the disk full?`,
+                    );
+                }
+                completedBytes += bytes.length;
+                lastActivity = Date.now();
+                onLocalProgress?.(completedBytes, size);
+            }
+        } catch (error) {
+            if (!fatal) fatal = error; // stop the other workers
+        }
+    }
+
+    // Watchdog: if not a single chunk completes within `stallTimeoutMs`
+    // (frozen proxy / dead datacenter connection), kill the connections so
+    // the caller can retry the whole part from scratch instead of hanging.
+    let rejectWatchdog;
     const watchdog = new Promise((_resolve, reject) => {
-        rejectStall = (error) => {
-            watchdogFired = true;
+        rejectWatchdog = (error) => {
+            watchdogFired.value = true;
+            if (!fatal) fatal = error;
             reject(error);
         };
     });
-    const checkIntervalMs = Math.min(1000, Math.max(50, Math.round(stallTimeoutMs / 4)));
-    const timer = setInterval(() => {
-        if (Date.now() - lastActivity >= stallTimeoutMs) {
-            rejectStall(
-                new Error(
-                    `download stalled: no data for ${Math.round(stallTimeoutMs / 1000)}s ` +
-                        '(proxy or datacenter connection frozen)',
-                ),
-            );
-        }
-    }, checkIntervalMs);
+    watchdog.catch(() => {}); // after the race resolves, rejections are moot
 
-    const download = client.downloadMedia(message, {
-        outputFile: outputPath,
-        progressCallback: (received, total) => {
-            lastActivity = Date.now();
-            progressCallback?.(received, total);
-        },
-    });
+    const checkIntervalMs = Math.min(1000, Math.max(50, Math.round(stallTimeoutMs / 4)));
+    const timer =
+        stallTimeoutMs > 0
+            ? setInterval(() => {
+                  if (Date.now() - lastActivity >= stallTimeoutMs) {
+                      rejectWatchdog(
+                          new Error(
+                              `download stalled: no data for ${Math.round(stallTimeoutMs / 1000)}s ` +
+                                  '(proxy or datacenter connection frozen)',
+                          ),
+                      );
+                  }
+              }, checkIntervalMs)
+            : null;
+
     try {
-        await Promise.race([download, watchdog]);
-    } catch (error) {
-        if (watchdogFired) {
-            download.catch(() => {}); // abandoned; its rejection is handled below
-            try {
-                await client.disconnect();
-            } catch {
-                /* the retry reconnects anyway */
+        await file.truncate(size);
+
+        const pool = Promise.all(Array.from({ length: workers }, worker));
+        pool.catch(() => {}); // worker errors land in `fatal`, never unhandled
+
+        try {
+            await Promise.race([pool, watchdog]);
+        } catch (error) {
+            if (!watchdogFired.value) throw error;
+            // Watchdog fired: kill every socket involved immediately (the
+            // main client alone may not own the DC sender the workers use),
+            // then fail so the caller retries the whole part from scratch.
+            const kills = [];
+            if (typeof client.disconnect === 'function') kills.push(client.disconnect());
+            if (activeSender && typeof activeSender.disconnect === 'function') {
+                kills.push(activeSender.disconnect());
             }
+            for (const kill of kills) {
+                try {
+                    await Promise.race([Promise.resolve(kill).catch(() => {}), sleep(5000)]);
+                } catch {
+                    /* best effort */
+                }
+            }
+            throw fatal ?? error;
+        }
+
+        if (fatal) throw fatal;
+
+        const stat = await file.stat();
+        if (stat.size !== size) {
+            throw new Error(`downloaded file is ${stat.size} bytes, Telegram reported ${size}`);
+        }
+        onLocalProgress?.(completedBytes, size);
+        return message;
+    } finally {
+        if (timer) clearInterval(timer);
+        await closeFile();
+        if (watchdogFired.value) {
             try {
-                fs.rmSync(outputPath, { force: true });
+                await fsp.rm(outputPath, { force: true });
             } catch {
                 /* best effort */
             }
         }
-        throw error;
-    } finally {
-        clearInterval(timer);
     }
-
-    return message;
 }
 
 async function closeClient(client) {
@@ -336,4 +519,5 @@ module.exports = {
     uploadDocument,
     downloadDocument,
     closeClient,
+    DOWNLOAD_CHUNK_SIZE,
 };

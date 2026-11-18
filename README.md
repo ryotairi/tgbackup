@@ -219,6 +219,19 @@ cat data.token | tgbackup restore - --out /srv/restore
 The archive contains the original target's basename, so backup of `/srv/data` restores to
 `<out>/data/...`.
 
+Downloads use AyuGram-style parallel fetching: the document is cut into 512 KiB chunks and
+`upload_workers` (default 8, 1–16) workers pull `upload.getFile` requests concurrently and
+write each chunk straight to disk at its offset — the whole file never sits in memory. The
+same tunable drives uploads and downloads; override for one restore with `--workers`:
+
+```sh
+tgbackup restore '<token>' --out /srv/restore --workers 4
+```
+
+`FLOOD_WAIT` throttles are honored automatically (GramJS sleeps waits up to 120 s internally,
+tgbackup honors waits up to 5 minutes beyond that); documents living in another data center
+are followed automatically (`FileMigrateError`), too.
+
 Downloads show live progress (percent, bytes, speed, ETA) per part and after each part:
 
 ```
@@ -324,7 +337,8 @@ Each part is a self-describing container:
 - No resume: an interrupted backup leaves uploaded parts in the chat but no token. Delete
   them manually.
 - Parts are uploaded sequentially to stay predictable on Telegram rate limits; within one
-  part, up to `upload_workers` (default 8) MTProto senders run in parallel.
+  part, up to `upload_workers` (default 8) MTProto senders run in parallel, and downloads
+  run up to `upload_workers` concurrent `upload.getFile` requests per part.
 - Telegram limits a document to 2 GiB (4 GiB with Premium); the tool validates this.
 - `session.txt` grants full access to the account. Keep it `0600` and out of backups you
   upload with the same account.

@@ -11,7 +11,7 @@ const { DEFAULT_DOWNLOAD_STALL_SECONDS } = require('./config');
 const { decryptFile } = require('./crypto');
 const { loadMasterKey } = require('./keys');
 const { createProgress, log, warn } = require('./log');
-const { closeClient, connect, downloadDocument } = require('./telegram');
+const { closeClient, connect, downloadDocument, DOWNLOAD_CHUNK_SIZE } = require('./telegram');
 const { decodeToken } = require('./token');
 const {
     ensureDir,
@@ -44,6 +44,11 @@ async function runRestore(config, options) {
         Number.isFinite(config.downloadStallMs) && config.downloadStallMs >= 0
             ? config.downloadStallMs
             : DEFAULT_DOWNLOAD_STALL_SECONDS * 1000;
+    // The same tunable drives parallel uploads and parallel downloads; a
+    // `--workers` flag on restore overrides the config value.
+    const downloadWorkers = Number.isInteger(options.workers) && options.workers >= 1
+        ? options.workers
+        : config.uploadWorkers;
 
     const destination = path.resolve(options.out || `restore-${slugify(token.name)}`);
     fs.mkdirSync(destination, { recursive: true, mode: 0o700 });
@@ -63,6 +68,9 @@ async function runRestore(config, options) {
     log(
         `download watchdog: retry a part when no data arrives for ${formatDuration(stallTimeoutMs)}` +
             (stallTimeoutMs === 0 ? ' (disabled)' : ''),
+    );
+    log(
+        `download plan: ${downloadWorkers} parallel workers, ${formatBytes(DOWNLOAD_CHUNK_SIZE)} chunks per part`,
     );
     if (token.createdAt) log(`created at ${token.createdAt}`);
     if (config.proxy) log(`using SOCKS${config.proxy.type === 'socks4' ? '4' : '5'} proxy ${config.proxy.host}:${config.proxy.port}`);
@@ -101,6 +109,7 @@ async function runRestore(config, options) {
                                 messageId: part.id,
                                 outputPath: encryptedPath,
                                 stallTimeoutMs,
+                                workers: downloadWorkers,
                                 onProgress: (received, total) =>
                                     progress.update(received, total || part.size),
                             });

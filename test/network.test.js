@@ -47,24 +47,181 @@ test('uploadDocument forwards workers and converts GramJS progress fractions to 
     assert.equal(message.id, 42);
 });
 
-test('downloadDocument kills a stalled download, disconnects and removes the partial file', async () => {
-    const os = require('node:os');
+const CHUNK = 512 * 1024;
+
+function stubMessage(size, dcId) {
+    return {
+        media: {
+            document: {
+                id: 5,
+                accessHash: 6,
+                fileReference: Buffer.from('file-reference'),
+                size,
+                ...(dcId === undefined ? {} : { dcId }),
+            },
+        },
+    };
+}
+
+test('downloadDocument pulls 512 KiB chunks in parallel and writes them at their offsets', async () => {
     const fs = require('node:fs');
+    const os = require('node:os');
+    const path = require('node:path');
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'tg-parallel-'));
+    const outputPath = path.join(work, 'part.enc');
+    const SIZE = CHUNK * 2 + 10; // two full chunks plus a short tail
+
+    const seenRequests = [];
+    const client = {
+        disconnected: false,
+        async getMessages() {
+            return [stubMessage(SIZE, 2)];
+        },
+        async getSender() {
+            return { dcId: 2 };
+        },
+        async invokeWithSender(request) {
+            seenRequests.push(request);
+            const offset = Number(request.offset);
+            const length = Math.min(CHUNK, SIZE - offset);
+            const chunk = offset / CHUNK;
+            return { bytes: Buffer.alloc(length, chunk + 1) }; // fill byte marks the chunk index
+        },
+        async disconnect() {},
+    };
+
+    const progress = [];
+    await downloadDocument(client, {
+        target: '-1001',
+        messageId: 11,
+        outputPath,
+        workers: 2,
+        onProgress: (received, total) => progress.push([received, total]),
+    });
+
+    assert.equal(fs.statSync(outputPath).size, SIZE, 'the file must be exactly the document size');
+    for (const request of seenRequests) {
+        assert.equal(request.limit, CHUNK, 'every GetFile request must use the 512 KiB chunk size');
+    }
+    assert.deepEqual(
+        seenRequests.map((request) => Number(request.offset)).sort((a, b) => a - b),
+        [0, CHUNK, 2 * CHUNK],
+        'chunks must cover the document from offset 0 with a shared queue',
+    );
+
+    const fd = fs.openSync(outputPath, 'r');
+    try {
+        for (const offset of [0, CHUNK, 2 * CHUNK]) {
+            const byte = Buffer.alloc(1);
+            fs.readSync(fd, byte, 0, 1, offset);
+            assert.equal(byte[0], offset / CHUNK + 1, `chunk data must land at offset ${offset}`);
+        }
+    } finally {
+        fs.closeSync(fd);
+    }
+    assert.deepEqual(progress[progress.length - 1], [SIZE, SIZE], 'progress must reach the full size');
+
+    fs.rmSync(work, { recursive: true, force: true });
+});
+
+test('downloadDocument handles FLOOD_WAIT by sleeping and retrying the chunk', async () => {
+    const fs = require('node:fs');
+    const os = require('node:os');
+    const path = require('node:path');
+    const { errors } = require('telegram');
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'tg-flood-'));
+    const outputPath = path.join(work, 'part.enc');
+
+    let attempts = 0;
+    const client = {
+        disconnected: false,
+        async getMessages() {
+            return [stubMessage(CHUNK, 2)];
+        },
+        async getSender() {
+            return { dcId: 2 };
+        },
+        async invokeWithSender(request) {
+            attempts += 1;
+            if (attempts === 1) {
+                throw Object.assign(new errors.FloodWaitError({}), { seconds: 1 });
+            }
+            return { bytes: Buffer.alloc(CHUNK, 7) };
+        },
+        async disconnect() {},
+    };
+
+    await downloadDocument(client, { target: '-1001', messageId: 12, outputPath, workers: 1 });
+
+    assert.equal(attempts, 2, 'the flooded chunk must be retried after the wait');
+    assert.equal(fs.statSync(outputPath).size, CHUNK);
+    fs.rmSync(work, { recursive: true, force: true });
+});
+
+test('downloadDocument follows FileMigrateError and borrows a sender for the new DC', async () => {
+    const fs = require('node:fs');
+    const os = require('node:os');
+    const path = require('node:path');
+    const { errors } = require('telegram');
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'tg-migrate-'));
+    const outputPath = path.join(work, 'part.enc');
+
+    const borrowedDcs = [];
+    let migrated = false;
+    const client = {
+        disconnected: false,
+        // the media predates the dc_id field, so the DC is unknown at first
+        async getMessages() {
+            return [stubMessage(CHUNK, undefined)];
+        },
+        async getSender(dcId) {
+            borrowedDcs.push(dcId);
+            return { dcId };
+        },
+        async invokeWithSender(request) {
+            if (!migrated) {
+                migrated = true;
+                throw Object.assign(new errors.FileMigrateError({}), { newDc: 4 });
+            }
+            return { bytes: Buffer.alloc(CHUNK, 9) };
+        },
+        async disconnect() {},
+    };
+
+    await downloadDocument(client, { target: '-1001', messageId: 13, outputPath });
+
+    assert.deepEqual(borrowedDcs, [undefined, 4], 'must re-borrow the sender into the migrated DC');
+    assert.equal(fs.statSync(outputPath).size, CHUNK);
+    fs.rmSync(work, { recursive: true, force: true });
+});
+
+test('downloadDocument kills a stalled download, disconnects senders and removes the partial file', async () => {
+    const fs = require('node:fs');
+    const os = require('node:os');
     const path = require('node:path');
     const work = fs.mkdtempSync(path.join(os.tmpdir(), 'tg-stall-'));
     const outputPath = path.join(work, 'part.enc');
 
     let connectedCalled = 0;
     let disconnectedCalled = 0;
+    let senderDisconnects = 0;
     const client = {
         disconnected: true, // simulate a previous stall having killed the senders
         async connect() {
             connectedCalled += 1;
         },
         async getMessages() {
-            return [{ media: {} }];
+            return [stubMessage(CHUNK, 2)];
         },
-        async downloadMedia() {
+        async getSender() {
+            return {
+                dcId: 2,
+                disconnect: () => {
+                    senderDisconnects += 1;
+                },
+            };
+        },
+        async invokeWithSender() {
             return new Promise(() => {}); // never finishes; watchdog must fire
         },
         async disconnect() {
@@ -76,37 +233,15 @@ test('downloadDocument kills a stalled download, disconnects and removes the par
         target: '-1001',
         messageId: 7,
         outputPath,
+        workers: 2,
         stallTimeoutMs: 60, // tiny so the test is fast (checked every ~50ms)
     });
-    await assert.rejects(watchdog, /download stalled.*60s|download stalled/);
+    await assert.rejects(watchdog, /download stalled/);
     assert.equal(connectedCalled, 1, 'must reconnect before starting the download');
-    assert.equal(disconnectedCalled, 1, 'senders must be killed after a stall');
+    assert.equal(disconnectedCalled, 1, 'the client must be killed after a stall');
+    assert.ok(senderDisconnects >= 1, 'the DC sender used by workers must also be killed');
     assert.ok(!fs.existsSync(outputPath), 'partial file must be removed');
     fs.rmSync(work, { recursive: true, force: true });
-});
-
-test('downloadDocument without a watchdog waits for downloadMedia to finish', async () => {
-    let progressSeen = [];
-    const client = {
-        disconnected: false,
-        async getMessages() {
-            return [{ media: {} }];
-        },
-        async disconnect() {},
-        async downloadMedia(_message, { progressCallback }) {
-            progressCallback('100', '200'); // GramJS passes big-integer-like values
-            return 'done';
-        },
-    };
-
-    const message = await downloadDocument(client, {
-        target: '-1001',
-        messageId: 9,
-        outputPath: '/tmp/unused',
-        onProgress: (received, total) => progressSeen.push([received, total]),
-    });
-    assert.deepEqual(progressSeen, [[100, 200]]);
-    assert.deepEqual(message, { media: {} });
 });
 
 test('the SOCKS proxy is passed to GramJS in its native shape', () => {

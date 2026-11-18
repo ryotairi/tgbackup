@@ -51,6 +51,7 @@ backup options:
 
 restore options:
   --out <dir>           restore destination (default: ./restore-<name>)
+  --workers <1-16>      parallel download workers per part (default from upload_workers)
   --token-file <file>   read the token from a file instead of the argument
   --keep-tmp            keep temporary part files
   --non-interactive     never prompt for a Telegram login
@@ -259,6 +260,8 @@ async function commandRestore(options, positionals) {
     await runRestore(config, {
         token,
         out: options.out === undefined ? undefined : requireValue(options.out, '--out'),
+        workers:
+            options.workers === undefined ? undefined : normalizeUploadWorkers(options.workers, '--workers'),
         keepTmp: Boolean(options.keepTmp),
         interactive: !options.nonInteractive,
     });
