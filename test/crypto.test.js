@@ -105,7 +105,7 @@ test('buffer encryption matches file decryption', async () => {
     fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test('token round-trips and carries ids, sizes and the random key', () => {
+test('token round-trips and carries ids, sizes, key and the backup chat', () => {
     const key = crypto.randomBytes(32);
     const token = encodeToken({
         name: 'backup-test',
@@ -116,18 +116,49 @@ test('token round-trips and carries ids, sizes and the random key', () => {
             { id: 215, size: 1024 },
             { id: 216, size: 2048 },
         ],
+        chat: '-1001234567890',
     });
 
     assert.match(token, /^[A-Za-z0-9_-]+$/);
     const decoded = decodeToken(token);
+    assert.equal(decoded.version, 2, 'new tokens are msgpack v2');
     assert.equal(decoded.name, 'backup-test');
     assert.equal(decoded.createdAt, '2026-11-16T00:00:00.000Z');
     assert.equal(decoded.root, 'data');
+    assert.equal(decoded.chat, '-1001234567890');
     assert.deepEqual(decoded.key, key);
     assert.deepEqual(decoded.parts, [
         { id: 215, size: 1024 },
         { id: 216, size: 2048 },
     ]);
+});
+
+test('legacy JSON tokens (v1, no chat) still decode', () => {
+    const legacy = Buffer.from(JSON.stringify({
+        v: 1,
+        n: 'old-backup',
+        t: '2025-01-01T00:00:00Z',
+        r: 'srv',
+        k: crypto.randomBytes(32).toString('base64url'),
+        p: [{ i: 42, s: 1337 }],
+    })).toString('base64url');
+
+    const decoded = decodeToken(legacy);
+    assert.equal(decoded.version, 1);
+    assert.equal(decoded.name, 'old-backup');
+    assert.equal(decoded.createdAt, '2025-01-01T00:00:00Z');
+    assert.equal(decoded.root, 'srv');
+    assert.equal(decoded.chat, null);
+    assert.equal(decoded.key.length, 32);
+    assert.deepEqual(decoded.parts, [{ id: 42, size: 1337 }]);
+});
+
+test('encodeToken requires the backup chat id', () => {
+    const key = crypto.randomBytes(32);
+    assert.throws(
+        () => encodeToken({ name: 'x', key, parts: [{ id: 1, size: 1 }] }),
+        /without the target chat id/,
+    );
 });
 
 test('token decoding rejects invalid input', () => {

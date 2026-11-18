@@ -21,7 +21,7 @@ test('proxy URL parsing supports SOCKS5 with credentials', () => {
         port: 1080,
         username: 'user',
         password: 'p@ss',
-        timeout: 10,
+        timeout: 30,
     });
 });
 
@@ -32,7 +32,7 @@ test('proxy object parsing supports socks4 and disabling', () => {
         port: 9050,
         username: undefined,
         password: undefined,
-        timeout: 10,
+        timeout: 30,
     });
     assert.equal(normalizeProxy({ enabled: false, host: 'proxy', port: 9050 }), null);
     assert.throws(() => normalizeProxy('http://proxy:8080'), /unsupported proxy scheme/);
@@ -83,6 +83,7 @@ test('config exposes resolved paths and defaults', () => {
     assert.equal(config.zstdLevel, 10);
     assert.equal(config.uploadWorkers, 8);
     assert.equal(config.stageArchive, true);
+    assert.equal(config.downloadStallMs, 300 * 1000);
     assert.equal(config.masterKeyFile, '/tmp/dir/master.key');
     assert.equal(config.sessionFile, '/tmp/dir/session.txt');
     assert.equal(config.proxy, null);
@@ -95,5 +96,19 @@ test('config exposes resolved paths and defaults', () => {
     assert.throws(
         () => normalizeConfig({ ...baseRaw, stage_archive: 'maybe' }, { configPath: '/tmp/x', baseDir: '/tmp' }),
         /must be a boolean/,
+    );
+
+    const noWatchdog = normalizeConfig(
+        { ...baseRaw, download_stall_timeout: 0 },
+        { configPath: '/tmp/dir/config.yml', baseDir: '/tmp/dir' },
+    );
+    assert.equal(noWatchdog.downloadStallMs, 0);
+    assert.throws(
+        () => normalizeConfig({ ...baseRaw, download_stall_timeout: -5 }, { configPath: '/tmp/x', baseDir: '/tmp' }),
+        /between 0 and 7200/,
+    );
+    assert.throws(
+        () => normalizeConfig({ ...baseRaw, download_stall_timeout: 9999 }, { configPath: '/tmp/x', baseDir: '/tmp' }),
+        /between 0 and 7200/,
     );
 });

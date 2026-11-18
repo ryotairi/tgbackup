@@ -238,7 +238,16 @@ async function uploadDocument(client, options) {
 }
 
 async function downloadDocument(client, options) {
-    const { target, messageId, outputPath, onProgress } = options;
+    const { target, messageId, outputPath, onProgress, stallTimeoutMs } = options;
+
+    // A previous attempt may have disconnected the senders after a stall.
+    if (client.disconnected) {
+        try {
+            await client.connect();
+        } catch (error) {
+            throw new Error(`reconnecting to Telegram failed: ${error.message}`);
+        }
+    }
 
     const messages = await client.getMessages(target, { ids: [messageId] });
     const message = Array.isArray(messages) ? messages[0] : messages;
@@ -246,10 +255,72 @@ async function downloadDocument(client, options) {
         throw new Error(`message ${messageId} not found or has no document attached`);
     }
 
-    await client.downloadMedia(message, {
-        outputFile: outputPath,
-        progressCallback: onProgress ? (received, total) => onProgress(received, total) : undefined,
+    const progressCallback = onProgress
+        ? (received, total) => {
+              // GramJS hands us big-integer instances here.
+              onProgress(Number(received), Number(total));
+          }
+        : undefined;
+
+    if (!stallTimeoutMs || stallTimeoutMs <= 0) {
+        await client.downloadMedia(message, {
+            outputFile: outputPath,
+            progressCallback,
+        });
+        return message;
+    }
+
+    // Watchdog: if no data arrives for `stallTimeoutMs` (frozen proxy / dead
+    // datacenter connection), kill the senders and fail so the caller can
+    // retry the whole part from scratch instead of hanging forever.
+    let lastActivity = Date.now();
+    let watchdogFired = false;
+    let rejectStall;
+    const watchdog = new Promise((_resolve, reject) => {
+        rejectStall = (error) => {
+            watchdogFired = true;
+            reject(error);
+        };
     });
+    const checkIntervalMs = Math.min(1000, Math.max(50, Math.round(stallTimeoutMs / 4)));
+    const timer = setInterval(() => {
+        if (Date.now() - lastActivity >= stallTimeoutMs) {
+            rejectStall(
+                new Error(
+                    `download stalled: no data for ${Math.round(stallTimeoutMs / 1000)}s ` +
+                        '(proxy or datacenter connection frozen)',
+                ),
+            );
+        }
+    }, checkIntervalMs);
+
+    const download = client.downloadMedia(message, {
+        outputFile: outputPath,
+        progressCallback: (received, total) => {
+            lastActivity = Date.now();
+            progressCallback?.(received, total);
+        },
+    });
+    try {
+        await Promise.race([download, watchdog]);
+    } catch (error) {
+        if (watchdogFired) {
+            download.catch(() => {}); // abandoned; its rejection is handled below
+            try {
+                await client.disconnect();
+            } catch {
+                /* the retry reconnects anyway */
+            }
+            try {
+                fs.rmSync(outputPath, { force: true });
+            } catch {
+                /* best effort */
+            }
+        }
+        throw error;
+    } finally {
+        clearInterval(timer);
+    }
 
     return message;
 }

@@ -15,7 +15,7 @@ the features the old version lacked:
 | Upload pacing | none | random delay between parts |
 | Proxy | none | outbound SOCKS4/SOCKS5 for every Telegram connection |
 | Login | interactive on every run | session cached in a `0600` file |
-| Output | `.msgids` in the CWD | self-contained base64url token (message ids + backup key) |
+| Output | `.msgids` in the CWD | self-contained base64url token (message ids + backup key + chat) |
 
 ## How it works
 
@@ -34,11 +34,33 @@ path ──tar──▶ zstd ──▶ split ──▶ AES-GCM(backup key) ─�
    again with your **single master key**. Both layers are required to read anything.
 4. Parts are uploaded as documents with a random delay between uploads.
 5. The command prints one base64url token. It contains the Telegram message ids of every
-   part and the random per-backup key. The master key is never included.
+   part, the random per-backup key and the chat id the parts were uploaded to. The master
+   key is never included.
 
 Restoring needs **both** the token and the master key. Losing either one makes the backup
 unreadable. The Telegram chat alone is not enough: without the master key the per-backup
 key cannot be used, and without the token there is no per-backup key at all.
+
+### Token format
+
+Tokens are **base64url + MessagePack** (format version 2) with compact single-letter
+fields:
+
+| key | meaning |
+| --- | --- |
+| `v` | token format version (2) |
+| `n` | backup name |
+| `t` | ISO creation timestamp |
+| `r` | archive root entry (original path basename) |
+| `k` | random per-backup AES-256-GCM key, 32 raw bytes |
+| `p` | parts: `[{i: message id, s: encrypted size}]` |
+| `c` | chat id the parts were uploaded to |
+
+Restore always downloads from the chat recorded in the token (`c`); `config.yml`'s chat is
+only used when *creating* a backup. If the token's chat differs from the configured one
+you get a `warning: token was created in chat ...` line, but the restore continues from
+the token's chat. Tokens of the **old JSON format (v1, no chat field) still decode**;
+their restores use the configured chat.
 
 ### Memory and disk
 
@@ -197,6 +219,22 @@ cat data.token | tgbackup restore - --out /srv/restore
 The archive contains the original target's basename, so backup of `/srv/data` restores to
 `<out>/data/...`.
 
+Downloads show live progress (percent, bytes, speed, ETA) per part and after each part:
+
+```
+part 3/9:  47% (121 MiB/256 MiB, 2.1 MiB/s, eta 1:02)
+```
+
+If a download receives **no data** for `download_stall_timeout` seconds (default 300,
+`0` disables), the watchdog kills the frozen senders and the part retries from scratch
+(up to 5 attempts, 3 s backoff). On a very slow proxy raise the value:
+
+```sh
+tgbackup restore '<token>'   # uses download_stall_timeout: 300 by default
+# e.g. 15 minutes of tolerance:
+TGBACKUP_DOWNLOAD_STALL_TIMEOUT=900 tgbackup restore '<token>'
+```
+
 ## Inspect a token
 
 ```sh
@@ -204,7 +242,8 @@ tgbackup info '<token>'
 tgbackup info '<token>' --json
 ```
 
-No network access and no master key needed: it only decodes the token.
+No network access and no master key needed: it only decodes the token. The output includes
+the recorded backup chat.
 
 ## Configuration
 
@@ -255,6 +294,7 @@ Handy for cron/containers:
 | `TGBACKUP_MASTER_KEY_FILE`, `TGBACKUP_SESSION_FILE`, `TGBACKUP_TMP_DIR` | paths |
 | `TGBACKUP_PART_SIZE`, `TGBACKUP_ZSTD_LEVEL`, `TGBACKUP_UPLOAD_WORKERS`, `TGBACKUP_STAGE_ARCHIVE` | tuning |
 | `TGBACKUP_CONNECT_TIMEOUT` | MTProto connect timeout in seconds |
+| `TGBACKUP_DOWNLOAD_STALL_TIMEOUT` | restore watchdog seconds (retry a frozen download) |
 | `TGBACKUP_DELAY_MIN`, `TGBACKUP_DELAY_MAX` | upload delay seconds |
 | `TGBACKUP_DEBUG=1` | full stack traces |
 

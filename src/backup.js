@@ -256,6 +256,9 @@ async function runBackup(config, options) {
         root,
         key: backupKey,
         parts,
+        // The chat configured for this backup; restore downloads from the chat
+        // recorded here (with a warning when it differs from the current config).
+        chat: String(config.target),
     });
 
     if (options.tokenOut) {

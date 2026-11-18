@@ -7,6 +7,7 @@ const { pipeline } = require('node:stream/promises');
 
 const { createDecompressorStream, createExtractStream } = require('./archive');
 const cleanup = require('./cleanup');
+const { DEFAULT_DOWNLOAD_STALL_SECONDS } = require('./config');
 const { decryptFile } = require('./crypto');
 const { loadMasterKey } = require('./keys');
 const { createProgress, log, warn } = require('./log');
@@ -15,6 +16,7 @@ const { decodeToken } = require('./token');
 const {
     ensureDir,
     formatBytes,
+    formatDuration,
     removeQuietly,
     slugify,
     withRetry,
@@ -23,6 +25,25 @@ const {
 async function runRestore(config, options) {
     const token = decodeToken(options.token);
     const masterKey = loadMasterKey(config);
+
+    // Backup/restore chat policy: the chat recorded in the token decides where
+    // parts are downloaded from; config.target is only what `backup` uses.
+    const chat = token.chat || config.target;
+    if (!token.chat) {
+        log('token has no chat id (old token format); using the chat from config');
+    } else if (config.target && token.chat !== config.target) {
+        warn(
+            `token was created in chat ${token.chat}, but the config targets ${config.target}; ` +
+                `restoring from ${token.chat}`,
+        );
+    }
+
+    const totalParts = token.parts.length;
+    const totalBytes = token.parts.reduce((sum, part) => sum + part.size, 0);
+    const stallTimeoutMs =
+        Number.isFinite(config.downloadStallMs) && config.downloadStallMs >= 0
+            ? config.downloadStallMs
+            : DEFAULT_DOWNLOAD_STALL_SECONDS * 1000;
 
     const destination = path.resolve(options.out || `restore-${slugify(token.name)}`);
     fs.mkdirSync(destination, { recursive: true, mode: 0o700 });
@@ -36,7 +57,13 @@ async function runRestore(config, options) {
     }
     cleanup.add(tmpDir);
 
-    log(`restoring backup "${token.name}" (${token.parts.length} part(s)) into ${destination}`);
+    log(
+        `restoring backup "${token.name}" (${totalParts} part(s), ${formatBytes(totalBytes)}) into ${destination}`,
+    );
+    log(
+        `download watchdog: retry a part when no data arrives for ${formatDuration(stallTimeoutMs)}` +
+            (stallTimeoutMs === 0 ? ' (disabled)' : ''),
+    );
     if (token.createdAt) log(`created at ${token.createdAt}`);
     if (config.proxy) log(`using SOCKS${config.proxy.type === 'socks4' ? '4' : '5'} proxy ${config.proxy.host}:${config.proxy.port}`);
 
@@ -45,9 +72,21 @@ async function runRestore(config, options) {
         client = await connect(config, { interactive: options.interactive });
 
         async function* decryptedParts() {
+            const started = Date.now();
+            let processedParts = 0;
+            let processedBytes = 0;
+            const progressLine = () => {
+                const percent = totalBytes > 0 ? Math.round((processedBytes / totalBytes) * 100) : 100;
+                log(
+                    `progress: ${processedParts}/${totalParts} part(s) processed, ` +
+                        `${formatBytes(processedBytes)}/${formatBytes(totalBytes)} (${percent}%), ` +
+                        `elapsed ${formatDuration(Date.now() - started)}`,
+                );
+            };
+
             for (let index = 0; index < token.parts.length; index += 1) {
                 const part = token.parts[index];
-                const label = `part ${index + 1}/${token.parts.length}`;
+                const label = `part ${index + 1}/${totalParts}`;
                 const encryptedPath = path.join(tmpDir, `part-${String(index).padStart(5, '0')}.enc`);
                 const plainPath = path.join(tmpDir, `part-${String(index).padStart(5, '0')}.raw`);
 
@@ -56,17 +95,18 @@ async function runRestore(config, options) {
                 try {
                     await withRetry(
                         () => {
-                            progress = createProgress(`downloading ${label}`);
+                            progress = createProgress(label);
                             return downloadDocument(client, {
-                                target: config.target,
+                                target: chat,
                                 messageId: part.id,
                                 outputPath: encryptedPath,
+                                stallTimeoutMs,
                                 onProgress: (received, total) =>
                                     progress.update(received, total || part.size),
                             });
                         },
                         {
-                            attempts: 4,
+                            attempts: 5,
                             baseDelayMs: 3000,
                             onRetry: (error, attempt, delay) => {
                                 if (progress) progress.finish();
@@ -77,6 +117,7 @@ async function runRestore(config, options) {
                             },
                         },
                     );
+                    log(`${label}: download complete (${formatBytes(part.size)})`);
                 } finally {
                     if (progress) progress.finish();
                 }
@@ -102,7 +143,15 @@ async function runRestore(config, options) {
                     stream.destroy();
                     fs.rmSync(plainPath, { force: true });
                 }
+                processedParts += 1;
+                processedBytes += part.size;
             }
+
+            progressLine();
+            log(
+                `all ${totalParts} part(s) extracted in ${formatDuration(Date.now() - started)}; ` +
+                    'finishing up',
+            );
         }
 
         await pipeline(

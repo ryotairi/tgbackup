@@ -41,7 +41,12 @@ upload_delay:
 
 # Give up opening the MTProto connection after this many seconds. Direct
 # connections to Telegram can black-hole for minutes on censored networks.
-connect_timeout: 30
+connect_timeout: 60
+
+# Restore watchdog: if a part download receives no data for this many seconds,
+# the frozen connection is killed and the part retries from scratch.
+# 0 disables the watchdog. Increase for very slow proxies.
+download_stall_timeout: 300
 
 # Scratch space for encrypted parts (created with mode 0700).
 tmp_dir: ./tmp
@@ -55,5 +60,5 @@ proxy:
   port: 1080
   username: ""
   password: ""
-  # timeout: 10                   # seconds, GramJS proxy connection timeout
+  # timeout: 30                   # seconds, GramJS proxy connection timeout
   # Alternatively: url: "socks5://user:pass@127.0.0.1:1080"

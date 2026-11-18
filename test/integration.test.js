@@ -122,6 +122,27 @@ test('backup -> token -> restore round-trip with a stubbed Telegram transport', 
         assert.deepEqual(restored[name], original[name], `content mismatch for ${name}`);
     }
 
+    // The token records the backup chat; restore uses it.
+    assert.equal(decoded.chat, '-1001', 'token must carry the chat used for backup');
+
+    // Restoring with a differently configured chat must still use the token's
+    // chat and emit a warning.
+    const captured = [];
+    const originalStderr = console.error;
+    console.error = (...args) => captured.push(args.join(' '));
+    try {
+        await runRestore(
+            { ...config, target: '-1002' },
+            { token, out: path.join(work, 'mismatch'), keepTmp: false, interactive: false },
+        );
+    } finally {
+        console.error = originalStderr;
+    }
+    assert.ok(
+        captured.some((line) => line.includes('token was created in chat -1001') && line.includes('-1002')),
+        'a chat mismatch must produce a warning',
+    );
+
     // A different master key must not be able to decrypt the parts.
     const wrongKeyPath = path.join(work, 'wrong.key');
     fs.writeFileSync(wrongKeyPath, `${generateMasterKey()}\n`, { mode: 0o600 });

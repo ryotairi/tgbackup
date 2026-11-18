@@ -272,6 +272,7 @@ async function commandInfo(options, positionals) {
         const payload = {
             name: token.name,
             createdAt: token.createdAt,
+            chat: token.chat,
             root: token.root,
             parts: token.parts,
             totalEncrypted,
@@ -286,6 +287,7 @@ async function commandInfo(options, positionals) {
         `parts: ${token.parts.length}`,
         `encrypted size: ${formatBytes(totalEncrypted)}`,
     ];
+    if (token.chat) lines.push(`chat: ${token.chat} (parts live here; restore uses this)`);
     if (token.root) lines.push(`archive root: ${token.root}`);
     token.parts.forEach((part, index) => {
         lines.push(`  part ${index + 1}: message ${part.id}, ${formatBytes(part.size)}`);

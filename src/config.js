@@ -14,6 +14,8 @@ const DEFAULT_PART_SIZE = 256 * 1024 * 1024;
 const DEFAULT_ZSTD_LEVEL = 10;
 const DEFAULT_UPLOAD_WORKERS = 8;
 const MAX_UPLOAD_WORKERS = 16;
+/** Kill and retry a download that stops receiving data for this long (seconds). */
+const DEFAULT_DOWNLOAD_STALL_SECONDS = 300;
 
 const CONFIG_FILENAMES = ['config.yml', 'config.yaml', 'tgbackup.yml', 'tgbackup.yaml'];
 
@@ -70,7 +72,8 @@ function parseProxyUrl(url) {
         port: Number(parsed.port),
         username: parsed.username ? decodeURIComponent(parsed.username) : undefined,
         password: parsed.password ? decodeURIComponent(parsed.password) : undefined,
-        timeout: 10,
+        // GramJS interprets this as seconds.
+        timeout: 30,
     };
 }
 
@@ -102,7 +105,7 @@ function normalizeProxy(value) {
         username: value.username ? String(value.username) : undefined,
         password: value.password ? String(value.password) : undefined,
         // GramJS interprets this as seconds.
-        timeout: Number.isFinite(Number(value.timeout)) && Number(value.timeout) > 0 ? Number(value.timeout) : 10,
+        timeout: Number.isFinite(Number(value.timeout)) && Number(value.timeout) > 0 ? Number(value.timeout) : 30,
     };
 }
 
@@ -221,10 +224,19 @@ function normalizeConfig(raw, { configPath, baseDir }) {
     const sessionFileValue = envValue('TGBACKUP_SESSION_FILE') ?? telegram.session_file ?? 'session.txt';
 
     const connectTimeoutSeconds = Number(
-        envValue('TGBACKUP_CONNECT_TIMEOUT') ?? data.connect_timeout ?? 30,
+        envValue('TGBACKUP_CONNECT_TIMEOUT') ?? data.connect_timeout ?? 60,
     );
     if (!Number.isFinite(connectTimeoutSeconds) || connectTimeoutSeconds <= 0 || connectTimeoutSeconds > 600) {
         throw new UsageError('connect_timeout must be between 1 and 600 seconds');
+    }
+
+    const downloadStallSeconds = Number(
+        envValue('TGBACKUP_DOWNLOAD_STALL_TIMEOUT') ??
+            data.download_stall_timeout ??
+            DEFAULT_DOWNLOAD_STALL_SECONDS,
+    );
+    if (!Number.isInteger(downloadStallSeconds) || downloadStallSeconds < 0 || downloadStallSeconds > 7200) {
+        throw new UsageError('download_stall_timeout must be an integer between 0 and 7200 seconds (0 disables it)');
     }
 
     return {
@@ -240,6 +252,7 @@ function normalizeConfig(raw, { configPath, baseDir }) {
         stageArchive,
         uploadDelay,
         connectTimeoutMs: Math.round(connectTimeoutSeconds * 1000),
+        downloadStallMs: downloadStallSeconds * 1000,
         premium,
         tmpDir: path.resolve(baseDir, tmpDirValue),
         masterKeyFile: path.resolve(baseDir, masterKeyFileValue),
@@ -266,6 +279,7 @@ module.exports = {
     DEFAULT_PART_SIZE,
     DEFAULT_ZSTD_LEVEL,
     DEFAULT_UPLOAD_WORKERS,
+    DEFAULT_DOWNLOAD_STALL_SECONDS,
     MAX_UPLOAD_WORKERS,
     PART_LIMIT_STANDARD,
     PART_LIMIT_PREMIUM,

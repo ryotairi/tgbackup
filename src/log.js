@@ -1,6 +1,6 @@
 'use strict';
 
-const { formatBytes } = require('./util');
+const { formatBytes, formatDuration } = require('./util');
 
 /**
  * GramJS logs with console.log, which would corrupt the token on stdout.
@@ -62,16 +62,44 @@ function warn(...args) {
 function createProgress(label) {
     let lastPercent = -1;
     let active = false;
+    const started = Date.now();
+    let lastTime = started;
+    let lastDone = 0;
+    let speed = 0; // smoothed bytes per second
 
     return {
         update(done, total) {
-            if (!Number.isFinite(total) || total <= 0) return;
-            const percent = Math.min(100, Math.max(0, (done / total) * 100));
+            const doneNum = Number(done);
+            const totalNum = Number(total);
+            if (!Number.isFinite(doneNum) || !Number.isFinite(totalNum) || totalNum <= 0) return;
+            if (doneNum < lastDone) {
+                // restarted attempt/seek: reset the rate estimator
+                lastDone = doneNum;
+                lastTime = Date.now();
+                speed = 0;
+            }
+
+            const now = Date.now();
+            const sinceLast = now - lastTime;
+            if (sinceLast >= 200 && doneNum > lastDone) {
+                const instant = ((doneNum - lastDone) / sinceLast) * 1000;
+                speed = speed > 0 ? speed * 0.5 + instant * 0.5 : instant;
+                lastTime = now;
+                lastDone = doneNum;
+            }
+
+            const percent = Math.min(100, Math.max(0, (doneNum / totalNum) * 100));
             if (percent === lastPercent) return;
             if (percent - lastPercent < 1 && percent < 100) return;
             lastPercent = percent;
             active = true;
-            const text = `${label}: ${percent.toFixed(0).padStart(3)}% (${formatBytes(done)}/${formatBytes(total)})`;
+
+            const speedText = speed > 1024 ? `, ${formatBytes(speed)}/s` : '';
+            const etaText =
+                speed > 1024 && doneNum < totalNum
+                    ? `, eta ${formatDuration(((totalNum - doneNum) / speed) * 1000)}`
+                    : '';
+            const text = `${label}: ${percent.toFixed(0).padStart(3)}% (${formatBytes(doneNum)}/${formatBytes(totalNum)}${speedText}${etaText})`;
             process.stderr.write(process.stderr.isTTY ? `\r${text.padEnd(72, ' ')}` : `${text}\n`);
             if (percent >= 100) {
                 process.stderr.write('\n');
